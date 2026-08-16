@@ -325,6 +325,8 @@ def create_imagewam_flux2_klein(
     mot_force_flash_attention: bool = False,
     pack_proprio_after_text: bool = True,
     flux2_lora_config=None,
+    goal_prior_stage: str | None = None,
+    goal_prior=None,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
@@ -363,6 +365,10 @@ def create_imagewam_flux2_klein(
         flux2_lora_config = {}
     if not isinstance(flux2_lora_config, dict):
         raise ValueError(f"`flux2_lora_config` must be dict-like, got {type(flux2_lora_config)}")
+    if isinstance(goal_prior, DictConfig):
+        goal_prior = OmegaConf.to_container(goal_prior, resolve=True)
+    if goal_prior is not None and not isinstance(goal_prior, dict):
+        raise ValueError(f"`goal_prior` must be dict-like or None, got {type(goal_prior)}")
     return ImageWAM.from_flux2_klein_pretrained(
         flux2_model_path=flux2_model_path,
         ae_model_path=ae_model_path,
@@ -389,6 +395,9 @@ def create_imagewam_flux2_klein(
         mot_force_flash_attention=bool(mot_force_flash_attention),
         pack_proprio_after_text=bool(pack_proprio_after_text),
         flux2_lora_config=flux2_lora_config,
+        goal_prior_stage=goal_prior_stage,
+        goal_prior=goal_prior,
+        loss_lambda_pose=float(loss.get("lambda_pose", 0.3)),
     )
 
 

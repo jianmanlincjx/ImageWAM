@@ -70,6 +70,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         lerobot_tolerance_s: Optional[float] = None,
         episode_index_filter: Optional[dict] = None,
         slow_getitem_log_sec: float = 0.0,
+        vision_free: bool = False,
     ):
         image_obs_indices = [0, num_frames - 1] if endpoint_frames_only else None
         self.slow_getitem_log_sec = float(
@@ -110,7 +111,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.video_sample_indices = list(range(0, num_frames, self.action_video_freq_ratio))
 
         self.camera_key = camera_key
-        self.lerobot_dataset._set_return_images(True)
+        self.vision_free = bool(vision_free)
+        self.lerobot_dataset._set_return_images(not self.vision_free)
 
         self.video_size = video_size
         self.text_embedding_cache_dir = text_embedding_cache_dir
@@ -225,12 +227,12 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 break
 
             action_is_pad = sample["action_is_pad"]
-            image_is_pad = sample["image_is_pad"]
+            image_is_pad = sample.get("image_is_pad")
             proprio_is_pad = sample["proprio_is_pad"]
             has_pad = False
             if bool(action_is_pad.any().item()):
                 has_pad = True
-            if bool(image_is_pad.any().item()):
+            if image_is_pad is not None and bool(image_is_pad.any().item()):
                 has_pad = True
             if bool(proprio_is_pad.any().item()):
                 has_pad = True
@@ -241,7 +243,68 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             sample_idx = np.random.randint(len(self.lerobot_dataset))
         _mark("padding_retry")
 
-        image_is_pad = sample["image_is_pad"]
+        image_is_pad = sample.get("image_is_pad")
+
+        action = sample["action"] # [T-1, action_dim]
+        if "proprio" not in sample:
+            raise KeyError("RobotVideoDataset sample is missing normalized `proprio`.")
+        if sample["proprio"].ndim != 2 or sample["proprio"].shape[0] < 2:
+            raise ValueError(
+                f"`proprio` must be [num_obs>=2, dim] before goal split, got {tuple(sample['proprio'].shape)}"
+            )
+        goal_pose = sample["proprio"][-1].clone()
+        goal_pose_is_pad = sample["proprio_is_pad"][-1].clone()
+        proprio = sample["proprio"][:-1, :] # [T-1, state_dim], aligned with action
+        proprio_is_pad = sample["proprio_is_pad"][:-1].clone()
+        if proprio.shape[0] != action.shape[0]:
+            raise ValueError(
+                f"`proprio` horizon after dropping the goal frame must match action, "
+                f"got {proprio.shape[0]} vs {action.shape[0]}"
+            )
+        if proprio_is_pad.shape[0] != proprio.shape[0]:
+            raise ValueError(
+                f"`proprio_is_pad` horizon must match proprio after dropping the goal frame, "
+                f"got {proprio_is_pad.shape[0]} vs {proprio.shape[0]}"
+            )
+
+        if self.vision_free:
+            task = sample["instruction"]
+            if self.override_instruction is not None:
+                task = self.override_instruction
+            instruction = DEFAULT_PROMPT.format(task=task)
+            data = {
+                "action": action,
+                "proprio": proprio,
+                "goal_pose": goal_pose,
+                "goal_pose_is_pad": goal_pose_is_pad,
+                "prompt": instruction,
+                "instruction": instruction,
+                "action_is_pad": sample["action_is_pad"],
+                "proprio_is_pad": proprio_is_pad,
+            }
+            if image_is_pad is not None:
+                data["image_is_pad"] = image_is_pad
+            if "action_dim_is_pad" in sample:
+                data["action_dim_is_pad"] = sample["action_dim_is_pad"]
+            if "proprio_dim_is_pad" in sample:
+                data["proprio_dim_is_pad"] = sample["proprio_dim_is_pad"]
+                data["goal_pose_dim_is_pad"] = sample["proprio_dim_is_pad"]
+            if "embodiment" in sample:
+                data["embodiment"] = sample["embodiment"]
+            if self.require_text_cache:
+                context, context_mask = self._get_cached_text_context(instruction)
+                context[~context_mask] = 0.0
+                context_mask = torch.ones_like(context_mask)
+                data["context"] = context
+                data["context_mask"] = context_mask
+            if self.qwen_text_cache_dir is not None:
+                text_hidden_states, text_attention_mask = self._get_cached_qwen_context(instruction)
+                data["text_hidden_states"] = text_hidden_states
+                data["text_attention_mask"] = text_attention_mask
+            _mark("qwen_cache")
+            if profile is not None:
+                data["_profile"] = profile
+            return data
 
         video = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]
         num_cameras = 1
@@ -308,11 +371,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         video = video.permute(1, 0, 2, 3) # [C, T_video, H, W], range [-1, 1]
         _mark("image_postprocess")
 
-        # Proxy (from lerobot): 
+        # Proxy (from lerobot):
         #   action: [num_frames-1, action_dim] # start from t0, except the last frame
-        #   proprio: [num_frames, proprio_dim] # start from t0 to the last frame, aligned with video frames
-        action = sample["action"] # [T-1, action_dim]
-        proprio = sample["proprio"][:-1, :] # [T-1, state_dim]， to align with action
+        #   proprio: [num_frames-1, proprio_dim] after dropping future goal at t+H
         if video.shape[1] <= 1:
             raise ValueError(f"`video` must have at least 2 frames, got shape {tuple(video.shape)}")
         expected_video_transitions = (self.num_frames - 1) // self.action_video_freq_ratio
@@ -336,16 +397,19 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "video": video,
             "action": action,
             "proprio": proprio,
+            "goal_pose": goal_pose,
+            "goal_pose_is_pad": goal_pose_is_pad,
             "prompt": instruction,
             "instruction": instruction,
             "image_is_pad": image_is_pad,
             "action_is_pad": sample["action_is_pad"],
-            "proprio_is_pad": sample["proprio_is_pad"],
+            "proprio_is_pad": proprio_is_pad,
         }
         if "action_dim_is_pad" in sample:
             data["action_dim_is_pad"] = sample["action_dim_is_pad"]
         if "proprio_dim_is_pad" in sample:
             data["proprio_dim_is_pad"] = sample["proprio_dim_is_pad"]
+            data["goal_pose_dim_is_pad"] = sample["proprio_dim_is_pad"]
         if "embodiment" in sample:
             data["embodiment"] = sample["embodiment"]
         if self.require_text_cache:

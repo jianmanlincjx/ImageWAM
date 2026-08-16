@@ -58,6 +58,11 @@ class Wan22Trainer:
         self.seed = int(cfg.seed)
         
         self.resume = cfg.resume
+        stage1_checkpoint = getattr(cfg, "stage1_checkpoint", None)
+        if stage1_checkpoint in (None, "", "null"):
+            self.stage1_checkpoint = None
+        else:
+            self.stage1_checkpoint = str(stage1_checkpoint)
         self._weights_resume_loaded_before_prepare = False
         self.mixed_precision = str(cfg.mixed_precision).strip().lower()
         if self.mixed_precision not in {"no", "fp16", "bf16"}:
@@ -106,10 +111,16 @@ class Wan22Trainer:
         # This keeps DiT (+ optional proprio encoder) as trainable when ZeRO builds optimizer state.
         self._apply_dit_only_train_mode(self.model)
         self._load_weights_checkpoint_before_prepare()
-        trainable_params = [param for param in self.model.dit.parameters() if param.requires_grad]
-        proprio_encoder = getattr(self.model, "proprio_encoder", None)
-        if proprio_encoder is not None:
-            trainable_params.extend(param for param in proprio_encoder.parameters() if param.requires_grad)
+        self._load_stage1_bridge_checkpoint_before_prepare()
+        collect = getattr(self.model, "collect_trainable_parameters", None)
+        if callable(collect):
+            trainable_params = collect()
+        else:
+            trainable_params = [param for param in self.model.dit.parameters() if param.requires_grad]
+            proprio_encoder = getattr(self.model, "proprio_encoder", None)
+            if proprio_encoder is not None:
+                trainable_params.extend(param for param in proprio_encoder.parameters() if param.requires_grad)
+        self._log_trainable_parameter_whitelist(self.model, trainable_params)
         if not trainable_params:
             raise ValueError("No trainable parameters found after applying trainable policy.")
         self.optimizer = torch.optim.AdamW(
@@ -444,6 +455,61 @@ class Wan22Trainer:
         self._weights_resume_loaded_before_prepare = True
         logger.warning("Loaded weights only; optimizer/scheduler/global step will start fresh.")
 
+    def _load_stage1_bridge_checkpoint_before_prepare(self):
+        if self.resume:
+            return
+        model = self.model
+        current_stage = getattr(model, "goal_prior_stage", None)
+        if current_stage == "stage2" and not self.stage1_checkpoint:
+            raise ValueError(
+                "Stage2 training requires `stage1_checkpoint` when `resume` is not set. "
+                "Pass STAGE1_CHECKPOINT=/path/to/stage1.pt, or resume= to continue an existing Stage2 run."
+            )
+        if not self.stage1_checkpoint:
+            return
+        if current_stage != "stage2":
+            raise ValueError(
+                "`stage1_checkpoint` is only valid when `model.goal_prior_stage=stage2`, "
+                f"got {current_stage!r}."
+            )
+        ckpt_path = Path(self.stage1_checkpoint)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Stage1 checkpoint not found: {self.stage1_checkpoint}")
+        logger.info(
+            "Loading Stage1→Stage2 bridge weights before accelerator.prepare: %s",
+            self.stage1_checkpoint,
+        )
+        model.load_checkpoint(str(ckpt_path), optimizer=None, goal_prior_bridge=True)
+
+    def _log_trainable_parameter_whitelist(self, model, trainable_params):
+        summarize = getattr(model, "summarize_trainable_parameters", None)
+        if callable(summarize):
+            groups = summarize()
+        else:
+            seen = set()
+            grouped = {}
+            for name, param in model.named_parameters():
+                if not param.requires_grad or id(param) in seen:
+                    continue
+                seen.add(id(param))
+                group = name.split(".")[0]
+                stats = grouped.setdefault(group, [0, 0])
+                stats[0] += 1
+                stats[1] += int(param.numel())
+            groups = [(group, counts[0], counts[1]) for group, counts in sorted(grouped.items())]
+        total_tensors = sum(item[1] for item in groups)
+        total_params = sum(item[2] for item in groups)
+        stage = getattr(model, "goal_prior_stage", None)
+        logger.info(
+            "Trainable parameter whitelist: stage=%s optimizer_tensors=%d grouped_tensors=%d grouped_params=%d",
+            stage,
+            len(trainable_params),
+            total_tensors,
+            total_params,
+        )
+        for group, n_tensors, n_params in groups:
+            logger.info("  trainable[%s] tensors=%d params=%d", group, n_tensors, n_params)
+
     def _resume_or_load_checkpoint(self):
         resume = self.resume
         if not resume:
@@ -486,8 +552,8 @@ class Wan22Trainer:
             proprio_encoder.requires_grad_(True)
 
     @staticmethod
-    def _to_batched_eval_sample(sample):
-        video = sample["video"]
+    def _to_batched_eval_sample(sample, require_video: bool = True):
+        video = sample.get("video")
         prompt = sample["prompt"]
         action = sample.get("action", None)
         proprio = sample.get("proprio", None)
@@ -502,19 +568,32 @@ class Wan22Trainer:
         image_is_pad = sample.get("image_is_pad", None)
         proprio_is_pad = sample.get("proprio_is_pad", None)
         proprio_dim_is_pad = sample.get("proprio_dim_is_pad", None)
+        goal_pose = sample.get("goal_pose", None)
+        goal_pose_is_pad = sample.get("goal_pose_is_pad", None)
+        goal_pose_dim_is_pad = sample.get("goal_pose_dim_is_pad", None)
 
-        if not isinstance(video, torch.Tensor):
-            raise TypeError(
-                f"Expected tensor video for evaluation, got {type(video)}. "
-                "Evaluation now expects `video` with shape [3,T,H,W] or [B,3,T,H,W]."
-            )
-        if video.ndim == 4:
-            video = video.unsqueeze(0)
-        if video.ndim != 5:
-            raise ValueError(f"Expected video shape [3,T,H,W] or [B,3,T,H,W], got {tuple(video.shape)}")
-        num_video_frames = video.shape[2]
-        if num_video_frames <= 1:
-            raise ValueError(f"`sample['video']` must have at least 2 frames for action evaluation, got {num_video_frames}")
+        num_video_frames = None
+        if video is None:
+            if require_video:
+                raise TypeError(
+                    "Expected tensor video for evaluation, got None. "
+                    "Evaluation now expects `video` with shape [3,T,H,W] or [B,3,T,H,W]."
+                )
+        else:
+            if not isinstance(video, torch.Tensor):
+                raise TypeError(
+                    f"Expected tensor video for evaluation, got {type(video)}. "
+                    "Evaluation now expects `video` with shape [3,T,H,W] or [B,3,T,H,W]."
+                )
+            if video.ndim == 4:
+                video = video.unsqueeze(0)
+            if video.ndim != 5:
+                raise ValueError(f"Expected video shape [3,T,H,W] or [B,3,T,H,W], got {tuple(video.shape)}")
+            num_video_frames = video.shape[2]
+            if num_video_frames <= 1:
+                raise ValueError(
+                    f"`sample['video']` must have at least 2 frames for action evaluation, got {num_video_frames}"
+                )
 
         if isinstance(prompt, str):
             prompt = [prompt]
@@ -522,8 +601,9 @@ class Wan22Trainer:
             prompt = list(prompt)
         elif not isinstance(prompt, list):
             raise TypeError(f"Expected prompt type str/list[str], got {type(prompt)}")
-        if len(prompt) != video.shape[0]:
-            raise ValueError(f"Prompt batch mismatch: len(prompt)={len(prompt)} vs video batch={video.shape[0]}")
+        batch_size = None if video is None else int(video.shape[0])
+        if batch_size is not None and len(prompt) != batch_size:
+            raise ValueError(f"Prompt batch mismatch: len(prompt)={len(prompt)} vs video batch={batch_size}")
         
         action_horizon = None
         action = None
@@ -537,7 +617,7 @@ class Wan22Trainer:
                 action = action.unsqueeze(0)
             if action.ndim != 3:
                 raise ValueError(f"`sample['action']` must be 3D [B, T, a_dim], got shape {tuple(action.shape)}")
-            if action.shape[1] % (num_video_frames - 1) != 0:
+            if num_video_frames is not None and action.shape[1] % (num_video_frames - 1) != 0:
                 raise ValueError(f"`sample['action']` temporal dimension must be divisible by video frames-1={num_video_frames - 1}, got {action.shape[1]}")
             action_horizon = int(action.shape[1])
 
@@ -556,7 +636,7 @@ class Wan22Trainer:
                 return None
             if not isinstance(value, torch.Tensor):
                 raise TypeError(f"`sample['{name}']` must be a torch.Tensor, got {type(value)}")
-            if value.ndim == expected_ndim - 1:
+            while value.ndim < expected_ndim:
                 value = value.unsqueeze(0)
             if value.ndim != expected_ndim:
                 raise ValueError(
@@ -569,6 +649,9 @@ class Wan22Trainer:
         image_is_pad = _batch_mask("image_is_pad", image_is_pad, 2)
         proprio_is_pad = _batch_mask("proprio_is_pad", proprio_is_pad, 2)
         proprio_dim_is_pad = _batch_mask("proprio_dim_is_pad", proprio_dim_is_pad, 2)
+        goal_pose = _batch_mask("goal_pose", goal_pose, 2)
+        goal_pose_is_pad = _batch_mask("goal_pose_is_pad", goal_pose_is_pad, 1)
+        goal_pose_dim_is_pad = _batch_mask("goal_pose_dim_is_pad", goal_pose_dim_is_pad, 2)
 
         if context is not None or context_mask is not None:
             if context is None or context_mask is None:
@@ -600,6 +683,9 @@ class Wan22Trainer:
             "instruction": prompt,
             "action": action,
             "proprio": proprio,
+            "goal_pose": goal_pose,
+            "goal_pose_is_pad": goal_pose_is_pad,
+            "goal_pose_dim_is_pad": goal_pose_dim_is_pad,
             "action_is_pad": action_is_pad,
             "action_dim_is_pad": action_dim_is_pad,
             "image_is_pad": image_is_pad,
@@ -658,6 +744,8 @@ class Wan22Trainer:
         is_flux2_stack = model_stack == "flux2"
         is_dim_stack = model_stack == "dim"
         is_image_prediction_stack = is_omnigen2_stack or is_ovis_u1_stack or is_flux2_stack or is_dim_stack
+        goal_prior_stage = getattr(model, "goal_prior_stage", None)
+        stage1_eval = goal_prior_stage == "stage1"
         rng = torch.Generator(device="cpu").manual_seed(self.global_step + self.accelerator.process_index)
         eval_indices = torch.randint(
             0,
@@ -674,19 +762,27 @@ class Wan22Trainer:
             self.val_dataset.video_augmentation = None
         try:
             for sample_slot, eval_index in enumerate(eval_indices):
-                sample = self._to_batched_eval_sample(self.val_dataset[eval_index])
+                sample = self._to_batched_eval_sample(
+                    self.val_dataset[eval_index],
+                    require_video=not stage1_eval,
+                )
 
                 # 1. training loss
                 with self.accelerator.autocast():
-                    val_loss, _ = model.training_loss(sample)
+                    val_loss, val_loss_dict = model.training_loss(sample)
                     val_loss = val_loss.float().item()
+                pose_loss = val_loss_dict.get("loss_pose") if isinstance(val_loss_dict, dict) else None
 
                 prompt = sample["prompt"][0]
-                video0 = sample["video"][0] # Tensor [3, T, H, W] in (-1, 1)
                 action = sample["action"][0] if "action" in sample and sample["action"] is not None else None
                 proprio = sample["proprio"][0, 0] if "proprio" in sample and sample["proprio"] is not None else None # from [1, T, d] to [d]
-                input_image = video0[:, 0].unsqueeze(0)
-                _, num_frames, _, _ = video0.shape
+                video0 = None
+                input_image = None
+                num_frames = 2
+                if sample.get("video") is not None:
+                    video0 = sample["video"][0] # Tensor [3, T, H, W] in (-1, 1)
+                    input_image = video0[:, 0].unsqueeze(0)
+                    _, num_frames, _, _ = video0.shape
 
                 # 2. inference and video saving
                 infer_kwargs = {
@@ -701,6 +797,10 @@ class Wan22Trainer:
                     "seed": 42,
                     "tiled": False,
                 }
+                if stage1_eval:
+                    infer_kwargs["goal_pose"] = (
+                        sample["goal_pose"][0] if sample.get("goal_pose") is not None else None
+                    )
                 if (is_omnigen2_stack or is_flux2_stack) and sample.get("text_hidden_states") is not None:
                     infer_kwargs["prompt"] = None
                     infer_kwargs["context"] = sample["text_hidden_states"][0]
@@ -716,22 +816,30 @@ class Wan22Trainer:
                     **infer_kwargs,
                 )
 
-                pred_video = pred["video"]
+                pred_video = pred.get("video") or []
                 pred_action = pred.get("action", None)
 
-                # 3. inference metrics against GT video
-                pred_video_tensor = pil_frames_to_video_tensor(pred_video)
-                gt_video_tensor = ((video0.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) * 0.5).contiguous()
-                if is_image_prediction_stack:
-                    gt_video_tensor = gt_video_tensor[:, -1:, :, :]
+                psnr_rollout_vs_gt = 0.0
+                ssim_rollout_vs_gt = 0.0
+                psnr_decode_vs_gt = 0.0
+                ssim_decode_vs_gt = 0.0
+                psnr_rollout_vs_decode = 0.0
+                ssim_rollout_vs_decode = 0.0
+                image_metrics_valid = 0.0
+                if not stage1_eval:
+                    # 3. inference metrics against GT video
+                    pred_video_tensor = pil_frames_to_video_tensor(pred_video)
+                    gt_video_tensor = ((video0.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) * 0.5).contiguous()
+                    if is_image_prediction_stack:
+                        gt_video_tensor = gt_video_tensor[:, -1:, :, :]
 
-                assert pred_video_tensor.shape == gt_video_tensor.shape, (
-                    "Eval infer prediction/GT shape mismatch: "
-                    f"pred={tuple(pred_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
-                )
+                    assert pred_video_tensor.shape == gt_video_tensor.shape, (
+                        "Eval infer prediction/GT shape mismatch: "
+                        f"pred={tuple(pred_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
+                    )
 
-                psnr_rollout_vs_gt = video_psnr(pred=pred_video_tensor, target=gt_video_tensor)
-                ssim_rollout_vs_gt = video_ssim(pred=pred_video_tensor, target=gt_video_tensor)
+                    psnr_rollout_vs_gt = video_psnr(pred=pred_video_tensor, target=gt_video_tensor)
+                    ssim_rollout_vs_gt = video_ssim(pred=pred_video_tensor, target=gt_video_tensor)
 
                 action_l1 = None
                 action_l2 = None
@@ -808,73 +916,76 @@ class Wan22Trainer:
                     action_l2 = action_diff.pow(2).masked_select(action_valid).sum().div(valid_count).item()
 
                 # 4. VAE reconstruction metrics against GT target.
-                if is_omnigen2_stack:
-                    gt_final = video0[:, -1].unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
-                    vae_latents = model._encode_omnigen2_image_latents(gt_final)
-                    vae_image = model._decode_omnigen2_image_latents(vae_latents)[0]
-                    vae_np = ((vae_image.detach().float().cpu().clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8).permute(1, 2, 0).numpy()
-                    vae_video_tensor = pil_frames_to_video_tensor([Image.fromarray(vae_np)])
-                elif is_ovis_u1_stack:
-                    gt_final = video0[:, -1].unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
-                    vae_tokens, _ = model._encode_ovis_u1_image_tokens(gt_final, time_value=0.0)
-                    vae_image = model._decode_ovis_u1_image_tokens(
-                        vae_tokens,
-                        height=int(gt_final.shape[-2]),
-                        width=int(gt_final.shape[-1]),
-                    )[0]
-                    vae_np = ((vae_image.detach().float().cpu().clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8).permute(1, 2, 0).numpy()
-                    vae_video_tensor = pil_frames_to_video_tensor([Image.fromarray(vae_np)])
-                elif is_flux2_stack:
-                    gt_final = video0[:, -1].unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
-                    vae_tokens, _ = model._encode_flux2_image_tokens(gt_final, time_value=0.0)
-                    vae_image = model._decode_flux2_image_tokens(
-                        vae_tokens,
-                        height=int(gt_final.shape[-2]),
-                        width=int(gt_final.shape[-1]),
-                    )[0]
-                    vae_np = ((vae_image.detach().float().cpu().clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8).permute(1, 2, 0).numpy()
-                    vae_video_tensor = pil_frames_to_video_tensor([Image.fromarray(vae_np)])
-                elif is_dim_stack:
-                    gt_final = video0[:, -1].unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
-                    vae_latents = model._encode_dim_image_latents(gt_final)
-                    vae_image = model._decode_dim_image_latents(vae_latents)[0]
-                    vae_np = ((vae_image.detach().float().cpu().clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8).permute(1, 2, 0).numpy()
-                    vae_video_tensor = pil_frames_to_video_tensor([Image.fromarray(vae_np)])
-                else:
-                    gt_video_batch = video0.unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
-                    vae_latents = model._encode_video_latents(gt_video_batch, tiled=False)
-                    vae_recon_video = model._decode_latents(vae_latents, tiled=False)
-                    vae_video_tensor = pil_frames_to_video_tensor(vae_recon_video)
+                if not stage1_eval:
+                    if is_omnigen2_stack:
+                        gt_final = video0[:, -1].unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
+                        vae_latents = model._encode_omnigen2_image_latents(gt_final)
+                        vae_image = model._decode_omnigen2_image_latents(vae_latents)[0]
+                        vae_np = ((vae_image.detach().float().cpu().clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8).permute(1, 2, 0).numpy()
+                        vae_video_tensor = pil_frames_to_video_tensor([Image.fromarray(vae_np)])
+                    elif is_ovis_u1_stack:
+                        gt_final = video0[:, -1].unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
+                        vae_tokens, _ = model._encode_ovis_u1_image_tokens(gt_final, time_value=0.0)
+                        vae_image = model._decode_ovis_u1_image_tokens(
+                            vae_tokens,
+                            height=int(gt_final.shape[-2]),
+                            width=int(gt_final.shape[-1]),
+                        )[0]
+                        vae_np = ((vae_image.detach().float().cpu().clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8).permute(1, 2, 0).numpy()
+                        vae_video_tensor = pil_frames_to_video_tensor([Image.fromarray(vae_np)])
+                    elif is_flux2_stack:
+                        gt_final = video0[:, -1].unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
+                        vae_tokens, _ = model._encode_flux2_image_tokens(gt_final, time_value=0.0)
+                        vae_image = model._decode_flux2_image_tokens(
+                            vae_tokens,
+                            height=int(gt_final.shape[-2]),
+                            width=int(gt_final.shape[-1]),
+                        )[0]
+                        vae_np = ((vae_image.detach().float().cpu().clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8).permute(1, 2, 0).numpy()
+                        vae_video_tensor = pil_frames_to_video_tensor([Image.fromarray(vae_np)])
+                    elif is_dim_stack:
+                        gt_final = video0[:, -1].unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
+                        vae_latents = model._encode_dim_image_latents(gt_final)
+                        vae_image = model._decode_dim_image_latents(vae_latents)[0]
+                        vae_np = ((vae_image.detach().float().cpu().clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8).permute(1, 2, 0).numpy()
+                        vae_video_tensor = pil_frames_to_video_tensor([Image.fromarray(vae_np)])
+                    else:
+                        gt_video_batch = video0.unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
+                        vae_latents = model._encode_video_latents(gt_video_batch, tiled=False)
+                        vae_recon_video = model._decode_latents(vae_latents, tiled=False)
+                        vae_video_tensor = pil_frames_to_video_tensor(vae_recon_video)
 
-                assert vae_video_tensor.shape == gt_video_tensor.shape, (
-                    "Eval VAE reconstruction/GT shape mismatch: "
-                    f"vae={tuple(vae_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
-                )
+                    assert vae_video_tensor.shape == gt_video_tensor.shape, (
+                        "Eval VAE reconstruction/GT shape mismatch: "
+                        f"vae={tuple(vae_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
+                    )
 
-                psnr_decode_vs_gt = video_psnr(pred=vae_video_tensor, target=gt_video_tensor)
-                ssim_decode_vs_gt = video_ssim(pred=vae_video_tensor, target=gt_video_tensor)
+                    psnr_decode_vs_gt = video_psnr(pred=vae_video_tensor, target=gt_video_tensor)
+                    ssim_decode_vs_gt = video_ssim(pred=vae_video_tensor, target=gt_video_tensor)
 
-                psnr_rollout_vs_decode = video_psnr(pred=pred_video_tensor, target=vae_video_tensor)
-                ssim_rollout_vs_decode = video_ssim(pred=pred_video_tensor, target=vae_video_tensor)
+                    psnr_rollout_vs_decode = video_psnr(pred=pred_video_tensor, target=vae_video_tensor)
+                    ssim_rollout_vs_decode = video_ssim(pred=pred_video_tensor, target=vae_video_tensor)
 
-                stitched_video_tensor = torch.cat(
-                    [pred_video_tensor, vae_video_tensor, gt_video_tensor],
-                    dim=2,
-                ).contiguous()
-                stitched_frames = []
-                for t in range(stitched_video_tensor.shape[1]):
-                    frame = (stitched_video_tensor[:, t].permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
-                    stitched_frames.append(Image.fromarray(frame))
+                    stitched_video_tensor = torch.cat(
+                        [pred_video_tensor, vae_video_tensor, gt_video_tensor],
+                        dim=2,
+                    ).contiguous()
+                    stitched_frames = []
+                    for t in range(stitched_video_tensor.shape[1]):
+                        frame = (stitched_video_tensor[:, t].permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
+                        stitched_frames.append(Image.fromarray(frame))
 
-                video_name = f"step_{self.global_step:06d}_rank_{self.accelerator.process_index:03d}"
-                if self.eval_num_samples > 1:
-                    video_name += f"_sample_{sample_slot:03d}"
-                current_video_path = os.path.join(self.eval_dir, f"{video_name}.mp4")
-                save_mp4(stitched_frames, current_video_path, fps=8)
-                if video_path is None:
-                    video_path = current_video_path
+                    video_name = f"step_{self.global_step:06d}_rank_{self.accelerator.process_index:03d}"
+                    if self.eval_num_samples > 1:
+                        video_name += f"_sample_{sample_slot:03d}"
+                    current_video_path = os.path.join(self.eval_dir, f"{video_name}.mp4")
+                    save_mp4(stitched_frames, current_video_path, fps=8)
+                    if video_path is None:
+                        video_path = current_video_path
+                    image_metrics_valid = 1.0
 
                 action_valid = action_l2 is not None and action_l1 is not None
+                pose_valid = pose_loss is not None
                 local_metric_rows.append(
                     [
                         float(val_loss),
@@ -887,6 +998,9 @@ class Wan22Trainer:
                         float(action_l2) if action_valid else 0.0,
                         float(action_l1) if action_valid else 0.0,
                         1.0 if action_valid else 0.0,
+                        float(pose_loss) if pose_valid else 0.0,
+                        1.0 if pose_valid else 0.0,
+                        float(image_metrics_valid),
                     ]
                 )
         finally:
@@ -908,22 +1022,34 @@ class Wan22Trainer:
         if action_valid_count.item() > 0:
             action_l2_mean = (gathered_metrics[:, 7].sum() / action_valid_count).item()
             action_l1_mean = (gathered_metrics[:, 8].sum() / action_valid_count).item()
+        pose_valid_count = gathered_metrics[:, 11].sum() if gathered_metrics.shape[1] > 11 else torch.zeros((), device=gathered_metrics.device)
+        pose_loss_mean = None
+        if pose_valid_count.item() > 0:
+            pose_loss_mean = (gathered_metrics[:, 10].sum() / pose_valid_count).item()
+        image_valid_count = gathered_metrics[:, 12].sum() if gathered_metrics.shape[1] > 12 else gathered_metrics.new_tensor(float(gathered_metrics.shape[0]))
 
         result = {
             "val_loss": float(mean_metrics[0].item()),
-            "psnr_rg": float(mean_metrics[1].item()),
-            "ssim_rg": float(mean_metrics[2].item()),
-            "psnr_rd": float(mean_metrics[3].item()),
-            "ssim_rd": float(mean_metrics[4].item()),
-            "psnr_dg": float(mean_metrics[5].item()),
-            "ssim_dg": float(mean_metrics[6].item()),
             "video_path": video_path,
             "num_samples": int(gathered_metrics.shape[0]),
         }
+        if image_valid_count.item() > 0:
+            result.update(
+                {
+                    "psnr_rg": float(mean_metrics[1].item()),
+                    "ssim_rg": float(mean_metrics[2].item()),
+                    "psnr_rd": float(mean_metrics[3].item()),
+                    "ssim_rd": float(mean_metrics[4].item()),
+                    "psnr_dg": float(mean_metrics[5].item()),
+                    "ssim_dg": float(mean_metrics[6].item()),
+                }
+            )
         if action_l2_mean is not None:
             result["action_l2"] = float(action_l2_mean)
         if action_l1_mean is not None:
             result["action_l1"] = float(action_l1_mean)
+        if pose_loss_mean is not None:
+            result["loss_pose"] = float(pose_loss_mean)
         return result
 
     def _save_weights_checkpoint(self, step_tag: str):
@@ -1184,32 +1310,30 @@ class Wan22Trainer:
                         metrics = self.evaluate()
                         self.accelerator.wait_for_everyone()
                         if metrics is not None and self.accelerator.is_main_process:
-                            description = "[eval] step=%d samples=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
+                            description = "[eval] step=%d samples=%d val_loss=%.4f" % (
                                 self.global_step,
                                 metrics["num_samples"],
                                 metrics["val_loss"],
-                                metrics["psnr_rd"],
-                                metrics["ssim_rd"],
                             )
+                            if "psnr_rd" in metrics:
+                                description += " infer_psnr=%.4f infer_ssim=%.4f" % (
+                                    metrics["psnr_rd"],
+                                    metrics["ssim_rd"],
+                                )
                             if "action_l2" in metrics:
                                 description += " action_l2=%.4f" % metrics["action_l2"]
                             if "action_l1" in metrics:
                                 description += " action_l1=%.4f" % metrics["action_l1"]
+                            if "loss_pose" in metrics:
+                                description += " loss_pose=%.4f" % metrics["loss_pose"]
                             logger.info(description)
                             eval_payload = {
                                 "eval/num_samples": int(metrics["num_samples"]),
                                 "eval/val_loss": float(metrics["val_loss"]),
-                                "eval/psnr_rg": float(metrics["psnr_rg"]),
-                                "eval/ssim_rg": float(metrics["ssim_rg"]),
-                                "eval/psnr_rd": float(metrics["psnr_rd"]),
-                                "eval/ssim_rd": float(metrics["ssim_rd"]),
-                                "eval/psnr_dg": float(metrics["psnr_dg"]),
-                                "eval/ssim_dg": float(metrics["ssim_dg"]),
                             }
-                            if "action_l2" in metrics:
-                                eval_payload["eval/action_l2"] = float(metrics["action_l2"])
-                            if "action_l1" in metrics:
-                                eval_payload["eval/action_l1"] = float(metrics["action_l1"])
+                            for key in ("psnr_rg", "ssim_rg", "psnr_rd", "ssim_rd", "psnr_dg", "ssim_dg", "action_l2", "action_l1", "loss_pose"):
+                                if key in metrics:
+                                    eval_payload[f"eval/{key}"] = float(metrics[key])
                             self._wandb_log(eval_payload)
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:

@@ -14,6 +14,17 @@ imagewam_init() {
     source "${REPO_ROOT}/.env.local"
     set +a
   fi
+
+  # TorchCodec dlopen needs CUDA 11 NPP from the pip nvidia-npp wheel.
+  local _npp_lib
+  for _npp_lib in "${REPO_ROOT}/.venv"/lib/python*/site-packages/nvidia/npp/lib; do
+    if [ -d "${_npp_lib}" ]; then
+      case ":${LD_LIBRARY_PATH:-}:" in
+        *":${_npp_lib}:"*) ;;
+        *) export LD_LIBRARY_PATH="${_npp_lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ;;
+      esac
+    fi
+  done
 }
 
 imagewam_require_env() {

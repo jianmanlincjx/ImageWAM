@@ -45,6 +45,9 @@ class ImageWAM(torch.nn.Module):
         omnigen2_online_text_cache_compatible: bool = False,
         qwen_context_len: int = 128,
         pack_proprio_after_text: bool = False,
+        goal_prior_stage: Optional[str] = None,
+        goal_prior: Optional[dict[str, Any]] = None,
+        loss_lambda_pose: float = 0.3,
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -91,12 +94,108 @@ class ImageWAM(torch.nn.Module):
         self.torch_dtype = torch_dtype
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
+        self.loss_lambda_pose = float(loss_lambda_pose)
         self.stack = str(stack)
         self.omnigen2_online_text_cache_compatible = bool(omnigen2_online_text_cache_compatible)
         self.qwen_context_len = int(qwen_context_len)
         self.pack_proprio_after_text = bool(pack_proprio_after_text)
+        self._configure_goal_prior(goal_prior_stage=goal_prior_stage, goal_prior=goal_prior)
 
         self.to(self.device)
+
+    def _configure_goal_prior(
+        self,
+        goal_prior_stage: Optional[str],
+        goal_prior: Optional[dict[str, Any]],
+    ) -> None:
+        from .goal_pose_prior import (
+            GOAL_PRIOR_INNER_DIM,
+            GOAL_PRIOR_LATENT_DIM,
+            GOAL_PRIOR_NUM_GOAL_TOKENS,
+            GOAL_PRIOR_NUM_GROUPS,
+            GOAL_PRIOR_NUM_LATENTS,
+            GOAL_PRIOR_NUM_POSE_TOKENS,
+            GOAL_PRIOR_POSE_LOSS_WEIGHT,
+            GoalPoseDecoder,
+            GoalPoseEncoder,
+            SemanticVisualAggregator,
+        )
+
+        stage = None if goal_prior_stage in (None, "", "none", "baseline") else str(goal_prior_stage)
+        if stage is not None and stage not in {"stage1", "stage2"}:
+            raise ValueError(f"`goal_prior_stage` must be 'stage1' or 'stage2', got {goal_prior_stage!r}")
+        self.goal_prior_stage = stage
+        cfg = dict(goal_prior or {})
+        self.goal_pose_encoder = None
+        self.semantic_visual_aggregator = None
+        self.semantic_visual_pose_norm = None
+        self.semantic_visual_pose_decoder = None
+        self.goal_prior_num_pose_tokens = None
+        if stage is None:
+            return
+        if self.stack != "flux2":
+            raise ValueError("Goal-pose prior is only implemented for the FLUX.2 stack.")
+        pose_dim = int(cfg.get("pose_dim", self.proprio_dim or 8))
+        hidden_size = int(getattr(self.video_expert, "hidden_dim", 3072))
+        num_heads = int(getattr(self.video_expert, "num_heads", 24))
+        attn_head_dim = int(getattr(self.video_expert, "attn_head_dim", hidden_size // max(num_heads, 1)))
+        kv_dim = num_heads * attn_head_dim
+        inner_dim = int(cfg.get("inner_dim", GOAL_PRIOR_INNER_DIM))
+        if stage == "stage1":
+            self.goal_pose_encoder = GoalPoseEncoder(
+                pose_dim=pose_dim,
+                num_tokens=int(cfg.get("num_goal_tokens", GOAL_PRIOR_NUM_GOAL_TOKENS)),
+                hidden_size=hidden_size,
+                inner_dim=inner_dim,
+            )
+            self.goal_pose_encoder.to(dtype=self.torch_dtype)
+            return
+        self.loss_lambda_pose = float(cfg.get("lambda_pose", self.loss_lambda_pose or GOAL_PRIOR_POSE_LOSS_WEIGHT))
+        num_latents = int(cfg.get("num_latents", GOAL_PRIOR_NUM_LATENTS))
+        num_pose_tokens = int(cfg.get("num_pose_tokens", GOAL_PRIOR_NUM_POSE_TOKENS))
+        if not 1 <= num_pose_tokens <= num_latents:
+            raise ValueError(
+                f"`num_pose_tokens` must satisfy 1 <= pose_tokens <= latents, got {num_pose_tokens}/{num_latents}"
+            )
+        self.goal_prior_num_pose_tokens = num_pose_tokens
+        self.semantic_visual_aggregator = SemanticVisualAggregator(
+            num_tokens=num_latents,
+            latent_dim=int(cfg.get("latent_dim", GOAL_PRIOR_LATENT_DIM)),
+            context_dim=hidden_size,
+            kv_dim=kv_dim,
+            attn_head_dim=attn_head_dim,
+            num_layer_groups=int(cfg.get("num_layer_groups", GOAL_PRIOR_NUM_GROUPS)),
+        )
+        latent_dim = int(cfg.get("latent_dim", GOAL_PRIOR_LATENT_DIM))
+        self.semantic_visual_pose_norm = nn.LayerNorm(latent_dim)
+        self.semantic_visual_pose_decoder = GoalPoseDecoder(
+            num_tokens=num_pose_tokens,
+            hidden_size=latent_dim,
+            pose_dim=pose_dim,
+            inner_dim=inner_dim,
+        )
+        for module in (
+            self.goal_pose_encoder,
+            self.semantic_visual_aggregator,
+            self.semantic_visual_pose_norm,
+            self.semantic_visual_pose_decoder,
+        ):
+            if module is not None:
+                module.to(dtype=self.torch_dtype)
+
+    def goal_prior_parameters(self, trainable_only: bool = True):
+        modules = [
+            self.goal_pose_encoder,
+            self.semantic_visual_aggregator,
+            self.semantic_visual_pose_norm,
+            self.semantic_visual_pose_decoder,
+        ]
+        params = []
+        for module in modules:
+            if module is None:
+                continue
+            params.extend(param for param in module.parameters() if (not trainable_only or param.requires_grad))
+        return params
 
     @classmethod
     def from_wan22_pretrained(
@@ -442,6 +541,9 @@ class ImageWAM(torch.nn.Module):
         flux2_lora_config: Optional[dict[str, Any]] = None,
         qwen3_model_spec: str | None = None,
         qwen_context_len: int = 512,
+        goal_prior_stage: Optional[str] = None,
+        goal_prior: Optional[dict[str, Any]] = None,
+        loss_lambda_pose: float = 0.3,
     ):
         from safetensors.torch import load_file as load_sft
 
@@ -571,6 +673,9 @@ class ImageWAM(torch.nn.Module):
             stack="flux2",
             qwen_context_len=int(qwen_context_len),
             pack_proprio_after_text=bool(pack_proprio_after_text),
+            goal_prior_stage=goal_prior_stage,
+            goal_prior=goal_prior,
+            loss_lambda_pose=loss_lambda_pose,
         )
         model.model_paths = {
             "flux2": flux2_model_path,
@@ -1849,6 +1954,61 @@ class ImageWAM(torch.nn.Module):
             context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True),
         )
 
+    def _sample_goal_pose(self, sample) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        goal_pose = sample.get("goal_pose")
+        if goal_pose is None:
+            raise ValueError("Goal-pose prior sample requires `goal_pose` [B, pose_dim].")
+        goal_pose = goal_pose.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+        if goal_pose.ndim == 1:
+            goal_pose = goal_pose.unsqueeze(0)
+        if goal_pose.ndim != 2:
+            raise ValueError(f"`goal_pose` must be [B, D], got {tuple(goal_pose.shape)}")
+        is_pad = sample.get("goal_pose_is_pad")
+        if is_pad is not None:
+            is_pad = is_pad.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        dim_is_pad = sample.get("goal_pose_dim_is_pad", sample.get("proprio_dim_is_pad"))
+        if dim_is_pad is not None:
+            dim_is_pad = dim_is_pad.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        return goal_pose, is_pad, dim_is_pad
+
+    def _empty_flux2_image_tokens(self, batch_size: int, like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        in_channels = int(getattr(self.video_expert.transformer, "in_channels", 128))
+        empty = like.new_zeros(batch_size, 0, in_channels)
+        empty_ids = like.new_zeros(batch_size, 0, 4)
+        return empty, empty_ids
+
+    def _append_goal_tokens_to_flux2_pre(self, video_pre: dict[str, Any], goal_pose: torch.Tensor) -> dict[str, Any]:
+        if self.goal_pose_encoder is None:
+            raise ValueError("Stage1 goal tokens require `goal_pose_encoder`.")
+        txt = video_pre["tokens"]["txt"]
+        goal_tokens = self.goal_pose_encoder(goal_pose.to(device=txt.device, dtype=txt.dtype))
+        txt = torch.cat([txt, goal_tokens], dim=1)
+        from .flux2_video_expert import Flux2VideoExpert
+
+        txt_ids = Flux2VideoExpert.build_txt_ids(
+            batch_size=int(txt.shape[0]),
+            seq_len=int(txt.shape[1]),
+            device=txt.device,
+            dtype=video_pre["freqs"]["txt"].dtype,
+        )
+        txt_pe = self.video_expert.transformer.pe_embedder(txt_ids)
+        goal_mask = torch.ones(txt.shape[0], goal_tokens.shape[1], dtype=torch.bool, device=txt.device)
+        text_mask = torch.cat([video_pre["text_mask"].to(device=txt.device, dtype=torch.bool), goal_mask], dim=1)
+        video_pre = dict(video_pre)
+        tokens = dict(video_pre["tokens"])
+        tokens["txt"] = txt
+        video_pre["tokens"] = tokens
+        freqs = dict(video_pre["freqs"])
+        freqs["txt"] = txt_pe
+        video_pre["freqs"] = freqs
+        video_pre["txt_len"] = int(txt.shape[1])
+        video_pre["text_mask"] = text_mask
+        video_pre["context_mask"] = text_mask
+        meta = dict(video_pre.get("meta") or {})
+        meta["txt_len"] = int(txt.shape[1])
+        video_pre["meta"] = meta
+        return video_pre
+
     def build_inputs_flux2(self, sample, tiled: bool = False):
         del tiled
         video = sample.get("video")
@@ -2402,6 +2562,14 @@ class ImageWAM(torch.nn.Module):
         }
 
     def _training_loss_flux2(self, sample, tiled: bool = False):
+        stage = getattr(self, "goal_prior_stage", None)
+        if stage == "stage1":
+            return self._training_loss_flux2_stage1(sample, tiled=tiled)
+        if stage == "stage2":
+            return self._training_loss_flux2_stage2(sample, tiled=tiled)
+        return self._training_loss_flux2_baseline(sample, tiled=tiled)
+
+    def _training_loss_flux2_baseline(self, sample, tiled: bool = False):
         inputs = self.build_inputs_flux2(sample, tiled=tiled)
         target_latent = inputs["target_latent"]
         action = inputs["action"]
@@ -2478,6 +2646,204 @@ class ImageWAM(torch.nn.Module):
         return loss_total, {
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
+        }
+
+    def _training_loss_flux2_stage1(self, sample, tiled: bool = False):
+        del tiled
+        from .goal_pose_prior import GOAL_PRIOR_NUM_GOAL_TOKENS
+
+        text_hidden_states, text_attention_mask = self._encode_flux2_text(sample)
+        if self.proprio_encoder is not None:
+            text_hidden_states, text_attention_mask = self._append_proprio_to_context_if_enabled(
+                context=text_hidden_states,
+                context_mask=text_attention_mask,
+                proprio=sample.get("proprio"),
+                source="FLUX.2 Stage1 sample",
+            )
+        action = sample["action"].to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+        action_is_pad = sample.get("action_is_pad")
+        if action_is_pad is not None:
+            action_is_pad = action_is_pad.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        action_dim_is_pad = sample.get("action_dim_is_pad")
+        if action_dim_is_pad is not None:
+            action_dim_is_pad = action_dim_is_pad.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        goal_pose, _, _ = self._sample_goal_pose(sample)
+        batch_size = int(action.shape[0])
+
+        noise_action = torch.randn_like(action)
+        timestep_action = self.train_action_scheduler.sample_training_t(
+            batch_size=batch_size,
+            device=self.device,
+            dtype=action.dtype,
+        )
+        noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
+        target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
+
+        empty_tokens, empty_ids = self._empty_flux2_image_tokens(batch_size, text_hidden_states)
+        video_timestep = torch.zeros((batch_size,), dtype=text_hidden_states.dtype, device=self.device)
+        video_pre = self.video_expert.pre_dit(
+            x=empty_tokens,
+            timestep=video_timestep,
+            context=text_hidden_states,
+            context_mask=text_attention_mask,
+            ref_image_hidden_states=None,
+            target_img_ids=empty_ids,
+            ref_img_ids=None,
+        )
+        video_pre = self._append_goal_tokens_to_flux2_pre(video_pre, goal_pose)
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=noisy_action,
+            timestep=self._scheduler_timestep_to_unit(timestep_action, self.train_action_scheduler),
+        )
+        attention_mask = self._build_mot_attention_mask_flux2(
+            batch_size=batch_size,
+            txt_len=int(video_pre["txt_len"]),
+            target_len=0,
+            cond_len=0,
+            action_len=int(action_pre["tokens"].shape[1]),
+            device=noisy_action.device,
+            text_attention_mask=video_pre["text_mask"],
+        )
+        tokens_out = self.mot(
+            embeds_all={"video": video_pre["tokens"], "action": action_pre["tokens"]},
+            attention_mask=attention_mask,
+            freqs_all={"video": video_pre["freqs"]},
+            context_all={"video": None, "action": {"ids": action_pre["ids"]}},
+            t_mod_all={"video": video_pre["t_mod"], "action": action_pre["t_mod"]},
+        )
+        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
+        action_loss_per_sample = self._compute_action_loss_per_sample(
+            pred_action=pred_action,
+            target_action=target_action,
+            action_is_pad=action_is_pad,
+            action_dim_is_pad=action_dim_is_pad,
+        )
+        action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
+            action_loss_per_sample.device,
+            dtype=action_loss_per_sample.dtype,
+        )
+        loss_action = (action_loss_per_sample * action_weight).mean()
+        loss_total = self.loss_lambda_action * loss_action
+        if int(self.goal_pose_encoder.num_tokens) != int(GOAL_PRIOR_NUM_GOAL_TOKENS):
+            raise ValueError(
+                f"Stage1 expects {GOAL_PRIOR_NUM_GOAL_TOKENS} goal tokens, got {self.goal_pose_encoder.num_tokens}"
+            )
+        return loss_total, {
+            "loss_action": float(loss_total.detach().item()),
+        }
+
+    def _training_loss_flux2_stage2(self, sample, tiled: bool = False):
+        from .goal_pose_prior import compute_pose_reconstruction_loss, build_stage2_action_attention_mask
+
+        inputs = self.build_inputs_flux2(sample, tiled=tiled)
+        goal_pose, goal_is_pad, goal_dim_is_pad = self._sample_goal_pose(sample)
+        target_latent = inputs["target_latent"]
+        action = inputs["action"]
+        batch_size = int(target_latent.shape[0])
+
+        noise_video = torch.randn_like(target_latent)
+        timestep_video = self.train_video_scheduler.sample_training_t(
+            batch_size=batch_size,
+            device=self.device,
+            dtype=target_latent.dtype,
+        )
+        noisy_latent = self.train_video_scheduler.add_noise(target_latent, noise_video, timestep_video)
+        target_video = self.train_video_scheduler.training_target(target_latent, noise_video, timestep_video)
+
+        noise_action = torch.randn_like(action)
+        timestep_action = self.train_action_scheduler.sample_training_t(
+            batch_size=batch_size,
+            device=self.device,
+            dtype=action.dtype,
+        )
+        noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
+        target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
+
+        video_pre = self.video_expert.pre_dit(
+            x=noisy_latent,
+            timestep=self._scheduler_timestep_to_unit(timestep_video, self.train_video_scheduler),
+            context=inputs["text_hidden_states"],
+            context_mask=inputs["text_attention_mask"],
+            ref_image_hidden_states=inputs["ref_image_latents"],
+            target_img_ids=inputs["target_img_ids"],
+            ref_img_ids=inputs["ref_img_ids"],
+        )
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=noisy_action,
+            timestep=self._scheduler_timestep_to_unit(timestep_action, self.train_action_scheduler),
+        )
+        video_mask = self._build_mot_attention_mask_flux2(
+            batch_size=batch_size,
+            txt_len=int(video_pre["txt_len"]),
+            target_len=int(video_pre["target_len"]),
+            cond_len=int(video_pre["cond_len"]),
+            action_len=0,
+            device=noisy_latent.device,
+            text_attention_mask=video_pre["text_mask"],
+        )
+        action_mask = build_stage2_action_attention_mask(
+            batch_size=batch_size,
+            txt_len=int(video_pre["txt_len"]),
+            synthetic_len=int(self.semantic_visual_aggregator.num_tokens),
+            action_len=int(action_pre["tokens"].shape[1]),
+            device=noisy_latent.device,
+            text_attention_mask=video_pre["text_mask"],
+        )
+        tokens_out = self.mot(
+            embeds_all={"video": video_pre["tokens"], "action": action_pre["tokens"]},
+            attention_mask={"double_joint": video_mask["double_joint"], "single": video_mask["single"], "action": action_mask},
+            freqs_all={"video": video_pre["freqs"]},
+            context_all={
+                "video": None,
+                "action": {"ids": action_pre["ids"]},
+                "goal_prior": {
+                    "mode": "stage2",
+                    "aggregator": self.semantic_visual_aggregator,
+                    "text_mask": video_pre["text_mask"],
+                    "cond_len": int(video_pre["cond_len"]),
+                    "target_len": int(video_pre["target_len"]),
+                },
+            },
+            t_mod_all={"video": video_pre["t_mod"], "action": action_pre["t_mod"]},
+        )
+        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
+        latents = tokens_out["goal_latents"]
+        pose_hidden = self.semantic_visual_pose_norm(latents[:, : int(self.goal_prior_num_pose_tokens)])
+        pred_pose = self.semantic_visual_pose_decoder(pose_hidden)
+        loss_pose = compute_pose_reconstruction_loss(
+            pred_pose,
+            goal_pose,
+            is_pad=goal_is_pad,
+            dim_is_pad=goal_dim_is_pad,
+        )
+
+        video_loss_per_sample = F.mse_loss(pred_video.float(), target_video.float(), reduction="none").flatten(1).mean(dim=1)
+        video_weight = self.train_video_scheduler.training_weight(timestep_video).to(
+            video_loss_per_sample.device,
+            dtype=video_loss_per_sample.dtype,
+        )
+        loss_video = (video_loss_per_sample * video_weight).mean()
+        action_loss_per_sample = self._compute_action_loss_per_sample(
+            pred_action=pred_action,
+            target_action=target_action,
+            action_is_pad=inputs["action_is_pad"],
+            action_dim_is_pad=inputs.get("action_dim_is_pad"),
+        )
+        action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
+            action_loss_per_sample.device,
+            dtype=action_loss_per_sample.dtype,
+        )
+        loss_action = (action_loss_per_sample * action_weight).mean()
+        loss_total = (
+            self.loss_lambda_video * loss_video
+            + self.loss_lambda_action * loss_action
+            + self.loss_lambda_pose * loss_pose
+        )
+        return loss_total, {
+            "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
+            "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
+            "loss_pose": self.loss_lambda_pose * float(loss_pose.detach().item()),
         }
 
     def _training_loss_dim(self, sample, tiled: bool = False):
@@ -3524,6 +3890,63 @@ class ImageWAM(torch.nn.Module):
         sigma_shift: Optional[float] = None,
         seed: Optional[int] = None,
         rand_device: str = "cpu",
+        goal_pose: Optional[torch.Tensor] = None,
+    ) -> dict[str, Any]:
+        stage = getattr(self, "goal_prior_stage", None)
+        if stage == "stage2" and goal_pose is not None:
+            raise ValueError("Stage2 action inference does not accept future `goal_pose`.")
+        if stage == "stage1":
+            return self._infer_action_flux2_stage1(
+                prompt=prompt,
+                action_horizon=action_horizon,
+                proprio=proprio,
+                context=context,
+                context_mask=context_mask,
+                num_inference_steps=num_inference_steps,
+                sigma_shift=sigma_shift,
+                seed=seed,
+                rand_device=rand_device,
+                goal_pose=goal_pose,
+            )
+        if stage == "stage2":
+            return self._infer_action_flux2_stage2(
+                prompt=prompt,
+                input_image=input_image,
+                action_horizon=action_horizon,
+                proprio=proprio,
+                context=context,
+                context_mask=context_mask,
+                num_inference_steps=num_inference_steps,
+                sigma_shift=sigma_shift,
+                seed=seed,
+                rand_device=rand_device,
+            )
+        return self._infer_action_flux2_baseline(
+            prompt=prompt,
+            input_image=input_image,
+            action_horizon=action_horizon,
+            proprio=proprio,
+            context=context,
+            context_mask=context_mask,
+            num_inference_steps=num_inference_steps,
+            sigma_shift=sigma_shift,
+            seed=seed,
+            rand_device=rand_device,
+        )
+
+    @torch.no_grad()
+    def _infer_action_flux2_baseline(
+        self,
+        prompt: Optional[str],
+        input_image: torch.Tensor,
+        action_horizon: int,
+        proprio: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        num_inference_steps: int = 20,
+        sigma_shift: Optional[float] = None,
+        seed: Optional[int] = None,
+        rand_device: str = "cpu",
     ) -> dict[str, Any]:
         self.eval()
         if input_image.ndim == 3:
@@ -3627,6 +4050,209 @@ class ImageWAM(torch.nn.Module):
             pred_action = self.action_expert.post_dit(action_tokens, action_pre)
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 
+        return {"action": latents_action[0].detach().to(device="cpu", dtype=torch.float32)}
+
+    @torch.no_grad()
+    def _infer_action_flux2_stage1(
+        self,
+        prompt: Optional[str],
+        action_horizon: int,
+        proprio: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        num_inference_steps: int = 20,
+        sigma_shift: Optional[float] = None,
+        seed: Optional[int] = None,
+        rand_device: str = "cpu",
+        goal_pose: Optional[torch.Tensor] = None,
+    ) -> dict[str, Any]:
+        self.eval()
+        if goal_pose is None:
+            raise ValueError("Stage1 action inference requires oracle `goal_pose`.")
+        text_hidden, text_mask = self._prepare_flux2_infer_text(prompt, context, context_mask)
+        if self.proprio_encoder is not None or proprio is not None:
+            text_hidden, text_mask = self._append_proprio_to_context_if_enabled(
+                context=text_hidden,
+                context_mask=text_mask,
+                proprio=proprio,
+                source="FLUX.2 Stage1 action inference",
+            )
+        goal_pose = goal_pose.to(device=self.device, dtype=self.torch_dtype)
+        if goal_pose.ndim == 1:
+            goal_pose = goal_pose.unsqueeze(0)
+        batch_size = int(text_hidden.shape[0])
+        generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+        latents_action = torch.randn(
+            (batch_size, action_horizon, self.action_expert.action_dim),
+            generator=generator,
+            device=rand_device,
+            dtype=torch.float32,
+        ).to(device=self.device, dtype=self.torch_dtype)
+        infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
+            num_inference_steps=num_inference_steps,
+            device=self.device,
+            dtype=latents_action.dtype,
+            shift_override=sigma_shift,
+        )
+        empty_tokens, empty_ids = self._empty_flux2_image_tokens(batch_size, text_hidden)
+        video_timestep = torch.zeros((batch_size,), dtype=text_hidden.dtype, device=self.device)
+        video_pre = self.video_expert.pre_dit(
+            x=empty_tokens,
+            timestep=video_timestep,
+            context=text_hidden,
+            context_mask=text_mask,
+            ref_image_hidden_states=None,
+            target_img_ids=empty_ids,
+            ref_img_ids=None,
+        )
+        video_pre = self._append_goal_tokens_to_flux2_pre(video_pre, goal_pose)
+        prefix_attention_mask = self._build_mot_attention_mask_flux2(
+            batch_size=batch_size,
+            txt_len=int(video_pre["txt_len"]),
+            target_len=0,
+            cond_len=0,
+            action_len=0,
+            device=latents_action.device,
+            text_attention_mask=video_pre["text_mask"],
+        )
+        video_kv_cache = self.mot.prefill_flux2_video_cache(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            attention_mask=prefix_attention_mask,
+        )
+        full_attention_mask = self._build_mot_attention_mask_flux2(
+            batch_size=batch_size,
+            txt_len=int(video_pre["txt_len"]),
+            target_len=0,
+            cond_len=0,
+            action_len=int(latents_action.shape[1]),
+            device=latents_action.device,
+            text_attention_mask=video_pre["text_mask"],
+        )
+        prefix_len = int(video_pre["txt_len"])
+        for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
+            timestep_action = step_t_action.expand(batch_size).to(dtype=latents_action.dtype, device=self.device)
+            action_pre = self.action_expert.pre_dit(
+                action_tokens=latents_action,
+                timestep=self._scheduler_timestep_to_unit(timestep_action, self.infer_action_scheduler),
+            )
+            action_tokens = self.mot.forward_action_with_video_cache(
+                action_tokens=action_pre["tokens"],
+                action_freqs=None,
+                action_t_mod=action_pre["t_mod"],
+                action_context_payload={"ids": action_pre["ids"]},
+                video_kv_cache=video_kv_cache,
+                attention_mask=full_attention_mask,
+                video_seq_len=prefix_len,
+            )
+            pred_action = self.action_expert.post_dit(action_tokens, action_pre)
+            latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
+        return {"action": latents_action[0].detach().to(device="cpu", dtype=torch.float32)}
+
+    @torch.no_grad()
+    def _infer_action_flux2_stage2(
+        self,
+        prompt: Optional[str],
+        input_image: torch.Tensor,
+        action_horizon: int,
+        proprio: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        num_inference_steps: int = 20,
+        sigma_shift: Optional[float] = None,
+        seed: Optional[int] = None,
+        rand_device: str = "cpu",
+    ) -> dict[str, Any]:
+        from .goal_pose_prior import build_stage2_action_attention_mask
+
+        self.eval()
+        if input_image.ndim == 3:
+            input_image = input_image.unsqueeze(0)
+        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+            raise ValueError(f"`input_image` must be [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}")
+        text_hidden, text_mask = self._prepare_flux2_infer_text(prompt, context, context_mask)
+        if self.proprio_encoder is not None or proprio is not None:
+            text_hidden, text_mask = self._append_proprio_to_context_if_enabled(
+                context=text_hidden,
+                context_mask=text_mask,
+                proprio=proprio,
+                source="FLUX.2 Stage2 action inference",
+            )
+        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+        ref_tokens, ref_img_ids = self._encode_flux2_image_tokens(input_image, time_value=10.0)
+        batch_size = int(ref_tokens.shape[0])
+        empty_target = ref_tokens.new_zeros(batch_size, 0, ref_tokens.shape[-1])
+        empty_target_ids = ref_img_ids.new_zeros(batch_size, 0, ref_img_ids.shape[-1])
+        generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+        latents_action = torch.randn(
+            (batch_size, action_horizon, self.action_expert.action_dim),
+            generator=generator,
+            device=rand_device,
+            dtype=torch.float32,
+        ).to(device=self.device, dtype=self.torch_dtype)
+        infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
+            num_inference_steps=num_inference_steps,
+            device=self.device,
+            dtype=latents_action.dtype,
+            shift_override=sigma_shift,
+        )
+        video_timestep = torch.zeros((batch_size,), dtype=ref_tokens.dtype, device=self.device)
+        video_pre = self.video_expert.pre_dit(
+            x=empty_target,
+            timestep=video_timestep,
+            context=text_hidden,
+            context_mask=text_mask,
+            ref_image_hidden_states=ref_tokens,
+            target_img_ids=empty_target_ids,
+            ref_img_ids=ref_img_ids,
+        )
+        video_mask = self._build_mot_attention_mask_flux2(
+            batch_size=batch_size,
+            txt_len=int(video_pre["txt_len"]),
+            target_len=0,
+            cond_len=int(video_pre["cond_len"]),
+            action_len=0,
+            device=latents_action.device,
+            text_attention_mask=video_pre["text_mask"],
+        )
+        goal_prior = {
+            "mode": "stage2",
+            "aggregator": self.semantic_visual_aggregator,
+            "text_mask": video_pre["text_mask"],
+            "cond_len": int(video_pre["cond_len"]),
+            "target_len": 0,
+        }
+        goal_prior_cache = self.mot.prefill_flux2_goal_prior_cache(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            attention_mask=video_mask,
+            goal_prior=goal_prior,
+        )
+        action_mask = build_stage2_action_attention_mask(
+            batch_size=batch_size,
+            txt_len=int(video_pre["txt_len"]),
+            synthetic_len=int(goal_prior_cache["synthetic_len"]),
+            action_len=int(latents_action.shape[1]),
+            device=latents_action.device,
+            text_attention_mask=video_pre["text_mask"],
+        )
+        for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
+            timestep_action = step_t_action.expand(batch_size).to(dtype=latents_action.dtype, device=self.device)
+            action_pre = self.action_expert.pre_dit(
+                action_tokens=latents_action,
+                timestep=self._scheduler_timestep_to_unit(timestep_action, self.infer_action_scheduler),
+            )
+            action_tokens = self.mot.forward_flux2_action_with_goal_prior_cache(
+                action_tokens=action_pre["tokens"],
+                action_ids=action_pre["ids"],
+                action_t_mod=action_pre["t_mod"],
+                goal_prior_cache=goal_prior_cache,
+                action_mask=action_mask,
+            )
+            pred_action = self.action_expert.post_dit(action_tokens, action_pre)
+            latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
         return {"action": latents_action[0].detach().to(device="cpu", dtype=torch.float32)}
 
     def _forward_flux2_video_only(
@@ -4234,6 +4860,7 @@ class ImageWAM(torch.nn.Module):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        goal_pose: Optional[torch.Tensor] = None,
     ):
         if self.stack == "ovis_u1":
             if action_horizon is None:
@@ -4328,7 +4955,12 @@ class ImageWAM(torch.nn.Module):
                 sigma_shift=sigma_shift,
                 seed=seed,
                 rand_device=rand_device,
+                goal_pose=goal_pose,
             )
+            if getattr(self, "goal_prior_stage", None) == "stage1":
+                return {"action": action_out["action"], "video": []}
+            if input_image is None:
+                raise ValueError("FLUX.2 video inference requires `input_image`.")
             video_out = self.infer_video_flux2(
                 prompt=prompt,
                 input_image=input_image,
@@ -4383,19 +5015,35 @@ class ImageWAM(torch.nn.Module):
             "mot": mot_state,
             "step": step,
             "torch_dtype": str(self.torch_dtype),
+            "goal_prior_stage": getattr(self, "goal_prior_stage", None),
         }
         if checkpoint_format != "full":
             payload["checkpoint_format"] = checkpoint_format
             payload["save_trainable_only"] = bool(getattr(self, "save_trainable_only", False))
         if self.proprio_encoder is not None:
             payload["proprio_encoder"] = self.proprio_encoder.state_dict()
+        if self.goal_pose_encoder is not None:
+            payload["goal_pose_encoder"] = self.goal_pose_encoder.state_dict()
+        if self.semantic_visual_aggregator is not None:
+            payload["semantic_visual_aggregator"] = self.semantic_visual_aggregator.state_dict()
+        if self.semantic_visual_pose_norm is not None:
+            payload["semantic_visual_pose_norm"] = self.semantic_visual_pose_norm.state_dict()
+        if self.semantic_visual_pose_decoder is not None:
+            payload["semantic_visual_pose_decoder"] = self.semantic_visual_pose_decoder.state_dict()
         if optimizer is not None:
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
 
-    def load_checkpoint(self, path, optimizer=None):
+    def load_checkpoint(self, path, optimizer=None, goal_prior_bridge: bool = False):
+        from .goal_pose_prior import validate_goal_prior_checkpoint_keys
+
         payload = torch.load(path, map_location="cpu")
         logger.info("Loading ImageWAM checkpoint from %s with payload keys=%s step=%s", path, sorted(payload.keys()), payload.get("step"))
+        current_stage = getattr(self, "goal_prior_stage", None)
+        payload_stage = payload.get("goal_prior_stage")
+        bridge_from_stage1 = bool(goal_prior_bridge) or (
+            current_stage == "stage2" and payload_stage == "stage1"
+        )
         if "mot" in payload:
             mot_state = payload["mot"]
             if self.stack == "flux2":
@@ -4411,10 +5059,17 @@ class ImageWAM(torch.nn.Module):
                 len(missing_keys),
                 len(unexpected_keys),
             )
-            if missing_keys:
-                logger.warning("First missing MoT keys: %s", missing_keys[:20])
-            if unexpected_keys:
-                logger.warning("First unexpected MoT keys: %s", unexpected_keys[:20])
+            if current_stage in {"stage1", "stage2"}:
+                if missing_keys or unexpected_keys:
+                    raise RuntimeError(
+                        "Goal-prior MoT load must be exact for ActionDiT/FLUX weights. "
+                        f"missing={missing_keys[:20]} unexpected={unexpected_keys[:20]}"
+                    )
+            else:
+                if missing_keys:
+                    logger.warning("First missing MoT keys: %s", missing_keys[:20])
+                if unexpected_keys:
+                    logger.warning("First unexpected MoT keys: %s", unexpected_keys[:20])
         elif "dit" in payload:
             logger.warning("Loading legacy `dit` checkpoint into video expert only.")
             load_result = self.video_expert.load_state_dict(payload["dit"], strict=False)
@@ -4429,10 +5084,46 @@ class ImageWAM(torch.nn.Module):
             if "proprio_encoder" in payload:
                 self.proprio_encoder.load_state_dict(payload["proprio_encoder"], strict=True)
                 logger.info("Loaded proprio_encoder weights from checkpoint.")
+            elif current_stage in {"stage1", "stage2"}:
+                raise RuntimeError("Goal-prior checkpoint is missing required `proprio_encoder` weights.")
             else:
                 logger.warning("Checkpoint has no `proprio_encoder` weights; keeping current `proprio_encoder` params.")
         elif "proprio_encoder" in payload:
             logger.warning("Checkpoint contains `proprio_encoder` weights but current model has `proprio_dim=None`; ignoring.")
+
+        if current_stage in {"stage1", "stage2"}:
+            missing = []
+            unexpected = []
+            module_specs = [
+                ("goal_pose_encoder", self.goal_pose_encoder),
+                ("semantic_visual_aggregator", self.semantic_visual_aggregator),
+                ("semantic_visual_pose_norm", self.semantic_visual_pose_norm),
+                ("semantic_visual_pose_decoder", self.semantic_visual_pose_decoder),
+            ]
+            for key, module in module_specs:
+                if module is None:
+                    if key in payload:
+                        unexpected.append(f"{key}.")
+                    continue
+                if key not in payload:
+                    missing.append(f"{key}.")
+                    continue
+                result = module.load_state_dict(payload[key], strict=False)
+                missing.extend(f"{key}.{name}" for name in result.missing_keys)
+                unexpected.extend(f"{key}.{name}" for name in result.unexpected_keys)
+            validate_goal_prior_checkpoint_keys(
+                current_stage=current_stage,
+                payload_stage=payload_stage,
+                missing_keys=missing,
+                unexpected_keys=unexpected,
+                bridge_from_stage1=bridge_from_stage1,
+            )
+            logger.info(
+                "Loaded goal-prior modules: current_stage=%s payload_stage=%s bridge=%s",
+                current_stage,
+                payload_stage,
+                bridge_from_stage1,
+            )
 
         if optimizer is not None and "optimizer" in payload:
             optimizer.load_state_dict(payload["optimizer"])
@@ -4447,6 +5138,28 @@ class ImageWAM(torch.nn.Module):
         if action_expert is not None:
             action_expert.train()
             action_expert.requires_grad_(True)
+        stage = getattr(self, "goal_prior_stage", None)
+        if stage == "stage1":
+            if video_expert is not None:
+                video_expert.eval()
+                video_expert.requires_grad_(False)
+            if self.goal_pose_encoder is not None:
+                self.goal_pose_encoder.train()
+                self.goal_pose_encoder.requires_grad_(True)
+            return
+        if stage == "stage2":
+            if video_expert is not None:
+                video_expert.train()
+                video_expert.requires_grad_(True)
+            for module in (
+                self.semantic_visual_aggregator,
+                self.semantic_visual_pose_norm,
+                self.semantic_visual_pose_decoder,
+            ):
+                if module is not None:
+                    module.train()
+                    module.requires_grad_(True)
+            return
         if video_expert is None or not bool(getattr(video_expert, "flux2_lora_enabled", False)):
             return
         video_expert.train()
@@ -4455,6 +5168,45 @@ class ImageWAM(torch.nn.Module):
         for name, param in video_expert.named_parameters():
             if ".lora_A" in name or ".lora_B" in name:
                 param.requires_grad = True
+
+    def collect_trainable_parameters(self):
+        seen: set[int] = set()
+        params = []
+        candidates = list(self.dit.parameters())
+        if self.proprio_encoder is not None:
+            candidates.extend(self.proprio_encoder.parameters())
+        candidates.extend(self.goal_prior_parameters(trainable_only=False))
+        for param in candidates:
+            if not param.requires_grad:
+                continue
+            key = id(param)
+            if key in seen:
+                continue
+            seen.add(key)
+            params.append(param)
+        return params
+
+    def summarize_trainable_parameters(self) -> list[tuple[str, int, int]]:
+        """Unique trainable parameters grouped by top-level / expert name."""
+        seen: set[int] = set()
+        groups: dict[str, list[int]] = {}
+        for name, param in self.named_parameters():
+            if not param.requires_grad or id(param) in seen:
+                continue
+            seen.add(id(param))
+            if name.startswith("mot.mixtures."):
+                parts = name.split(".")
+                group = ".".join(parts[:3]) if len(parts) >= 3 else name
+            elif name.startswith("video_expert."):
+                group = "mot.mixtures.video"
+            elif name.startswith("action_expert."):
+                group = "mot.mixtures.action"
+            else:
+                group = name.split(".")[0]
+            stats = groups.setdefault(group, [0, 0])
+            stats[0] += 1
+            stats[1] += int(param.numel())
+        return [(group, counts[0], counts[1]) for group, counts in sorted(groups.items())]
 
     def forward(self, *args, **kwargs):
         return self.training_loss(*args, **kwargs)

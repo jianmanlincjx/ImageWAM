@@ -126,6 +126,8 @@ class MoT(nn.Module):
         v_cat: torch.Tensor,
         attention_mask: torch.Tensor,
         return_attn_probs: bool = False,
+        *,
+        checkpoint: bool | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         batch_size, query_len, _ = q_cat.shape
         key_len = k_cat.shape[1]
@@ -174,7 +176,12 @@ class MoT(nn.Module):
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
             return out.transpose(1, 2).reshape(batch_size, query_len, H * D)
 
-        if self.mot_checkpoint_mixed_attn and self.training:
+        should_checkpoint = (
+            bool(self.mot_checkpoint_mixed_attn and self.training)
+            if checkpoint is None
+            else bool(checkpoint)
+        )
+        if should_checkpoint:
             return torch.utils.checkpoint.checkpoint(_forward, q_cat, k_cat, v_cat, use_reentrant=False)
         return _forward(q_cat, k_cat, v_cat)
 
@@ -528,6 +535,12 @@ class MoT(nn.Module):
             "residual_x": x,
         }
 
+    def _flux2_maybe_checkpoint(self, fn, *args):
+        """Checkpoint one FLUX.2 MoT layer so Stage1 can keep autograd through frozen FLUX."""
+        if self.mot_checkpoint_mixed_attn and self.training:
+            return torch.utils.checkpoint.checkpoint(fn, *args, use_reentrant=False)
+        return fn(*args)
+
     def _forward_flux2(
         self,
         embeds_all: Dict[str, object],
@@ -558,56 +571,373 @@ class MoT(nn.Module):
         action_pe = video_expert.transformer.pe_embedder(action_ids.to(device=img.device, dtype=img.dtype))
         video_t_mod = t_mod_all["video"]
         action_t_mod = t_mod_all["action"]
+        double_mask = attention_mask["double_joint"]
+        single_mask = attention_mask["single"]
+
+        from flux2.model import apply_rope
 
         for layer_idx in range(int(getattr(video_expert, "double_layers"))):
             v_block = video_expert.double_blocks[layer_idx]
             a_block = action_expert.double_blocks[layer_idx]
-            q, k, v, pe_full, num_txt_tokens, mods = v_block._prepare_qkv(
+
+            def _double_layer(
+                img_tokens,
+                txt_tokens,
+                action_tokens,
+                video_double_img,
+                video_double_txt,
+                action_double_img,
+                *,
+                v_block=v_block,
+                a_block=a_block,
+            ):
+                q, k, v, pe_full, num_txt_tokens, mods = v_block._prepare_qkv(
+                    img_tokens,
+                    txt_tokens,
+                    img_pe,
+                    txt_pe,
+                    video_double_img,
+                    video_double_txt,
+                )
+                q, k = apply_rope(q, k, pe_full)
+                video_q = self._flux2_flatten_heads(q)
+                video_k = self._flux2_flatten_heads(k)
+                video_v = self._flux2_flatten_heads(v)
+                action_state = a_block.prepare_qkv(action_tokens, action_pe, action_double_img)
+                mixed = self._mixed_attention(
+                    torch.cat([video_q, action_state["q"]], dim=1),
+                    torch.cat([video_k, action_state["k"]], dim=1),
+                    torch.cat([video_v, action_state["v"]], dim=1),
+                    double_mask,
+                    checkpoint=False,
+                )
+                video_attn, action_attn = torch.split(
+                    mixed, [txt_tokens.shape[1] + img_tokens.shape[1], action_tokens.shape[1]], dim=1
+                )
+                txt_attn, img_attn = torch.split(video_attn, [num_txt_tokens, img_tokens.shape[1]], dim=1)
+                img_tokens, txt_tokens = v_block._apply_residuals(
+                    img_tokens, txt_tokens, img_attn, txt_attn, mods
+                )
+                action_tokens = a_block.apply_post(action_attn, action_state)
+                return img_tokens, txt_tokens, action_tokens
+
+            img, txt, action = self._flux2_maybe_checkpoint(
+                _double_layer,
                 img,
                 txt,
-                img_pe,
-                txt_pe,
+                action,
                 video_t_mod["double_img"],
                 video_t_mod["double_txt"],
+                action_t_mod["double_img"],
             )
-            from flux2.model import apply_rope
-
-            q, k = apply_rope(q, k, pe_full)
-            video_q = self._flux2_flatten_heads(q)
-            video_k = self._flux2_flatten_heads(k)
-            video_v = self._flux2_flatten_heads(v)
-            action_state = a_block.prepare_qkv(action, action_pe, action_t_mod["double_img"])
-            mixed = self._mixed_attention(
-                torch.cat([video_q, action_state["q"]], dim=1),
-                torch.cat([video_k, action_state["k"]], dim=1),
-                torch.cat([video_v, action_state["v"]], dim=1),
-                attention_mask["double_joint"],
-            )
-            video_attn, action_attn = torch.split(mixed, [txt.shape[1] + img.shape[1], action.shape[1]], dim=1)
-            txt_attn, img_attn = torch.split(video_attn, [num_txt_tokens, img.shape[1]], dim=1)
-            img, txt = v_block._apply_residuals(img, txt, img_attn, txt_attn, mods)
-            action = a_block.apply_post(action_attn, action_state)
 
         video_stream = torch.cat([txt, img], dim=1)
         stream_pe = torch.cat([txt_pe, img_pe], dim=2)
         for layer_idx in range(int(getattr(video_expert, "single_layers"))):
             v_block = video_expert.single_blocks[layer_idx]
             a_block = action_expert.single_blocks[layer_idx]
-            video_state = self._flux2_video_single_io(v_block, video_stream, stream_pe, video_t_mod["single"])
-            action_state = a_block.prepare_qkv(action, action_pe, action_t_mod["single"])
-            mixed = self._mixed_attention(
-                torch.cat([video_state["q"], action_state["q"]], dim=1),
-                torch.cat([video_state["k"], action_state["k"]], dim=1),
-                torch.cat([video_state["v"], action_state["v"]], dim=1),
-                attention_mask["single"],
+
+            def _single_layer(
+                stream,
+                action_tokens,
+                video_single,
+                action_single,
+                *,
+                v_block=v_block,
+                a_block=a_block,
+            ):
+                video_io = self._flux2_video_single_io(v_block, stream, stream_pe, video_single)
+                action_state = a_block.prepare_qkv(action_tokens, action_pe, action_single)
+                mixed = self._mixed_attention(
+                    torch.cat([video_io["q"], action_state["q"]], dim=1),
+                    torch.cat([video_io["k"], action_state["k"]], dim=1),
+                    torch.cat([video_io["v"], action_state["v"]], dim=1),
+                    single_mask,
+                    checkpoint=False,
+                )
+                video_attn, action_attn = torch.split(mixed, [stream.shape[1], action_tokens.shape[1]], dim=1)
+                stream = v_block._out(video_io["residual_x"], video_attn, video_io["mlp"], video_io["gate"])
+                action_tokens = a_block.apply_post(action_attn, action_state)
+                return stream, action_tokens
+
+            video_stream, action = self._flux2_maybe_checkpoint(
+                _single_layer,
+                video_stream,
+                action,
+                video_t_mod["single"],
+                action_t_mod["single"],
             )
-            video_attn, action_attn = torch.split(mixed, [video_stream.shape[1], action.shape[1]], dim=1)
-            video_stream = v_block._out(video_state["residual_x"], video_attn, video_state["mlp"], video_state["gate"])
-            action = a_block.apply_post(action_attn, action_state)
 
         txt_len = int(txt.shape[1])
         txt, img = video_stream[:, :txt_len], video_stream[:, txt_len:]
         return {"video": {"txt": txt, "img": img}, "action": action}
+
+    def _flux2_project_synthetic_kv(
+        self,
+        aggregator,
+        latents: torch.Tensor,
+        *,
+        layer_idx: int,
+        num_layers: int,
+        pe_embedder,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from flux2.model import apply_rope
+
+        from .goal_pose_prior import build_synthetic_token_ids
+
+        syn_k, syn_v = aggregator.project_kv(latents, layer_idx=layer_idx, num_layers=num_layers)
+        batch_size, seq_len, hidden = syn_k.shape
+        ids = build_synthetic_token_ids(
+            batch_size,
+            seq_len,
+            device=syn_k.device,
+            dtype=syn_k.dtype,
+        )
+        pe = pe_embedder(ids.to(device=syn_k.device, dtype=syn_k.dtype))
+        k = syn_k.view(batch_size, seq_len, self.num_heads, self.attn_head_dim).transpose(1, 2)
+        dummy_q = k
+        _, k = apply_rope(dummy_q, k, pe)
+        syn_k = k.transpose(1, 2).reshape(batch_size, seq_len, hidden)
+        return syn_k, syn_v
+
+    def _flux2_update_goal_latents(
+        self,
+        aggregator,
+        latents: torch.Tensor,
+        txt: torch.Tensor,
+        img: torch.Tensor,
+        *,
+        text_mask: torch.Tensor,
+        cond_len: int,
+        layer_idx: int,
+        num_layers: int,
+    ) -> torch.Tensor:
+        visual = img[:, :cond_len] if cond_len > 0 else txt.new_zeros(txt.shape[0], 1, txt.shape[2])
+        visual_mask = torch.ones(visual.shape[0], visual.shape[1], dtype=torch.bool, device=visual.device)
+        if cond_len <= 0:
+            visual_mask.zero_()
+        return aggregator.forward_layer(
+            latents,
+            txt,
+            visual,
+            semantic_mask=text_mask,
+            image_mask=visual_mask,
+            layer_idx=layer_idx,
+            num_layers=num_layers,
+        )
+
+    def _forward_flux2_stage2(
+        self,
+        embeds_all: Dict[str, object],
+        attention_mask: dict[str, torch.Tensor],
+        freqs_all: Dict[str, object],
+        context_all: Dict[str, Optional[dict]],
+        t_mod_all: Dict[str, object],
+    ):
+        if "video" not in self.mixtures or "action" not in self.mixtures:
+            raise ValueError("FLUX.2 MoT requires `video` and `action` experts.")
+        goal_prior = context_all.get("goal_prior") if context_all is not None else None
+        if not isinstance(goal_prior, dict):
+            raise ValueError("Stage2 FLUX.2 MoT requires context_all['goal_prior'].")
+        aggregator = goal_prior.get("aggregator")
+        if aggregator is None:
+            raise ValueError("Stage2 FLUX.2 MoT requires goal_prior['aggregator'].")
+        video_expert = self.mixtures["video"]
+        action_expert = self.mixtures["action"]
+        video_state = embeds_all["video"]
+        if not isinstance(video_state, dict):
+            raise ValueError("FLUX.2 video embeds must be a dict with `txt` and `img` tensors.")
+        txt = video_state["txt"]
+        img = video_state["img"]
+        action = embeds_all["action"]
+        if not isinstance(action, torch.Tensor):
+            raise ValueError("FLUX.2 action embeds must be a tensor.")
+
+        video_freqs = freqs_all["video"]
+        txt_pe = video_freqs["txt"]
+        img_pe = video_freqs["img"]
+        action_ids = context_all["action"]["ids"]
+        action_pe = video_expert.transformer.pe_embedder(action_ids.to(device=img.device, dtype=img.dtype))
+        video_t_mod = t_mod_all["video"]
+        action_t_mod = t_mod_all["action"]
+        text_mask = goal_prior["text_mask"].to(device=txt.device, dtype=torch.bool)
+        action_mask = attention_mask["action"]
+        video_mask = attention_mask["double_joint"]
+        txt_len = int(txt.shape[1])
+        cond_len = int(goal_prior["cond_len"])
+        target_len = int(goal_prior["target_len"])
+        if img.shape[1] != cond_len + target_len:
+            raise ValueError(
+                f"Stage2 img length {img.shape[1]} != cond_len+target_len {cond_len + target_len}"
+            )
+        if text_mask.shape != (txt.shape[0], txt_len):
+            raise ValueError(f"Stage2 text_mask must be [B, txt_len], got {tuple(text_mask.shape)}")
+        double_layers = int(getattr(video_expert, "double_layers"))
+        single_layers = int(getattr(video_expert, "single_layers"))
+        num_layers = double_layers + single_layers
+        latents = aggregator.initial_queries(txt.shape[0]).to(device=txt.device, dtype=txt.dtype)
+        pe_embedder = video_expert.transformer.pe_embedder
+
+        from flux2.model import apply_rope
+
+        for layer_idx in range(double_layers):
+            v_block = video_expert.double_blocks[layer_idx]
+            a_block = action_expert.double_blocks[layer_idx]
+
+            def _double_layer(
+                img_tokens,
+                txt_tokens,
+                action_tokens,
+                goal_latents,
+                video_double_img,
+                video_double_txt,
+                action_double_img,
+                *,
+                v_block=v_block,
+                a_block=a_block,
+                layer_idx=layer_idx,
+            ):
+                q, k, v, pe_full, num_txt_tokens, mods = v_block._prepare_qkv(
+                    img_tokens,
+                    txt_tokens,
+                    img_pe,
+                    txt_pe,
+                    video_double_img,
+                    video_double_txt,
+                )
+                q, k = apply_rope(q, k, pe_full)
+                video_q = self._flux2_flatten_heads(q)
+                video_k = self._flux2_flatten_heads(k)
+                video_v = self._flux2_flatten_heads(v)
+                video_attn = self._mixed_attention(video_q, video_k, video_v, video_mask, checkpoint=False)
+                txt_attn, img_attn = torch.split(video_attn, [num_txt_tokens, img_tokens.shape[1]], dim=1)
+                img_tokens, txt_tokens = v_block._apply_residuals(
+                    img_tokens, txt_tokens, img_attn, txt_attn, mods
+                )
+                goal_latents = self._flux2_update_goal_latents(
+                    aggregator,
+                    goal_latents,
+                    txt_tokens,
+                    img_tokens,
+                    text_mask=text_mask,
+                    cond_len=cond_len,
+                    layer_idx=layer_idx,
+                    num_layers=num_layers,
+                )
+                syn_k, syn_v = self._flux2_project_synthetic_kv(
+                    aggregator,
+                    goal_latents,
+                    layer_idx=layer_idx,
+                    num_layers=num_layers,
+                    pe_embedder=pe_embedder,
+                )
+                action_state = a_block.prepare_qkv(action_tokens, action_pe, action_double_img)
+                txt_k = video_k[:, :txt_len]
+                txt_v = video_v[:, :txt_len]
+                mixed = self._mixed_attention(
+                    action_state["q"],
+                    torch.cat(
+                        [txt_k.to(action_state["k"].dtype), syn_k.to(action_state["k"].dtype), action_state["k"]],
+                        dim=1,
+                    ),
+                    torch.cat(
+                        [txt_v.to(action_state["v"].dtype), syn_v.to(action_state["v"].dtype), action_state["v"]],
+                        dim=1,
+                    ),
+                    action_mask,
+                    checkpoint=False,
+                )
+                action_tokens = a_block.apply_post(mixed, action_state)
+                return img_tokens, txt_tokens, action_tokens, goal_latents
+
+            img, txt, action, latents = self._flux2_maybe_checkpoint(
+                _double_layer,
+                img,
+                txt,
+                action,
+                latents,
+                video_t_mod["double_img"],
+                video_t_mod["double_txt"],
+                action_t_mod["double_img"],
+            )
+
+        video_stream = torch.cat([txt, img], dim=1)
+        stream_pe = torch.cat([txt_pe, img_pe], dim=2)
+        for local_idx in range(single_layers):
+            layer_idx = double_layers + local_idx
+            v_block = video_expert.single_blocks[local_idx]
+            a_block = action_expert.single_blocks[local_idx]
+
+            def _single_layer(
+                stream,
+                action_tokens,
+                goal_latents,
+                video_single,
+                action_single,
+                *,
+                v_block=v_block,
+                a_block=a_block,
+                layer_idx=layer_idx,
+            ):
+                video_state = self._flux2_video_single_io(v_block, stream, stream_pe, video_single)
+                video_attn = self._mixed_attention(
+                    video_state["q"], video_state["k"], video_state["v"], video_mask, checkpoint=False
+                )
+                stream = v_block._out(video_state["residual_x"], video_attn, video_state["mlp"], video_state["gate"])
+                txt_tokens = stream[:, :txt_len]
+                img_tokens = stream[:, txt_len:]
+                goal_latents = self._flux2_update_goal_latents(
+                    aggregator,
+                    goal_latents,
+                    txt_tokens,
+                    img_tokens,
+                    text_mask=text_mask,
+                    cond_len=cond_len,
+                    layer_idx=layer_idx,
+                    num_layers=num_layers,
+                )
+                syn_k, syn_v = self._flux2_project_synthetic_kv(
+                    aggregator,
+                    goal_latents,
+                    layer_idx=layer_idx,
+                    num_layers=num_layers,
+                    pe_embedder=pe_embedder,
+                )
+                action_state = a_block.prepare_qkv(action_tokens, action_pe, action_single)
+                txt_k = video_state["k"][:, :txt_len]
+                txt_v = video_state["v"][:, :txt_len]
+                mixed = self._mixed_attention(
+                    action_state["q"],
+                    torch.cat(
+                        [txt_k.to(action_state["k"].dtype), syn_k.to(action_state["k"].dtype), action_state["k"]],
+                        dim=1,
+                    ),
+                    torch.cat(
+                        [txt_v.to(action_state["v"].dtype), syn_v.to(action_state["v"].dtype), action_state["v"]],
+                        dim=1,
+                    ),
+                    action_mask,
+                    checkpoint=False,
+                )
+                action_tokens = a_block.apply_post(mixed, action_state)
+                return stream, action_tokens, goal_latents
+
+            video_stream, action, latents = self._flux2_maybe_checkpoint(
+                _single_layer,
+                video_stream,
+                action,
+                latents,
+                video_t_mod["single"],
+                action_t_mod["single"],
+            )
+            txt = video_stream[:, :txt_len]
+            img = video_stream[:, txt_len:]
+
+        return {
+            "video": {"txt": txt, "img": img},
+            "action": action,
+            "goal_latents": latents,
+        }
 
     def prefill_flux2_video_cache(
         self,
@@ -742,6 +1072,175 @@ class MoT(nn.Module):
             else:
                 mixed = self._mixed_attention(state["q"], k_cat, v_cat, single_mask)
             action = block.apply_post(mixed, state)
+        return action
+
+    def prefill_flux2_goal_prior_cache(
+        self,
+        video_tokens: dict[str, torch.Tensor],
+        video_freqs: dict[str, torch.Tensor],
+        video_t_mod: dict[str, object],
+        attention_mask: dict[str, torch.Tensor],
+        goal_prior: dict[str, object],
+    ) -> dict[str, object]:
+        if self.block_protocol != "flux2":
+            raise ValueError("`prefill_flux2_goal_prior_cache` requires block_protocol='flux2'.")
+        aggregator = goal_prior.get("aggregator")
+        if aggregator is None:
+            raise ValueError("`goal_prior['aggregator']` is required for Stage2 cache prefill.")
+        video_expert = self.mixtures["video"]
+        txt = video_tokens["txt"]
+        img = video_tokens["img"]
+        txt_pe = video_freqs["txt"]
+        img_pe = video_freqs["img"]
+        text_mask = goal_prior["text_mask"].to(device=txt.device, dtype=torch.bool)
+        video_mask = attention_mask["double_joint"]
+        txt_len = int(txt.shape[1])
+        cond_len = int(goal_prior["cond_len"])
+        target_len = int(goal_prior.get("target_len", img.shape[1] - cond_len))
+        if img.shape[1] != cond_len + target_len:
+            raise ValueError(
+                f"Stage2 img length {img.shape[1]} != cond_len+target_len {cond_len + target_len}"
+            )
+        double_layers = int(getattr(video_expert, "double_layers"))
+        single_layers = int(getattr(video_expert, "single_layers"))
+        num_layers = double_layers + single_layers
+        latents = aggregator.initial_queries(txt.shape[0]).to(device=txt.device, dtype=txt.dtype)
+        pe_embedder = video_expert.transformer.pe_embedder
+        from flux2.model import apply_rope
+
+        double_cache = []
+        for layer_idx in range(double_layers):
+            block = video_expert.double_blocks[layer_idx]
+            q, k, v, pe_full, num_txt_tokens, mods = block._prepare_qkv(
+                img,
+                txt,
+                img_pe,
+                txt_pe,
+                video_t_mod["double_img"],
+                video_t_mod["double_txt"],
+            )
+            q, k = apply_rope(q, k, pe_full)
+            video_q = self._flux2_flatten_heads(q)
+            video_k = self._flux2_flatten_heads(k)
+            video_v = self._flux2_flatten_heads(v)
+            video_attn = self._mixed_attention(video_q, video_k, video_v, video_mask)
+            txt_attn, img_attn = torch.split(video_attn, [num_txt_tokens, img.shape[1]], dim=1)
+            img, txt = block._apply_residuals(img, txt, img_attn, txt_attn, mods)
+            latents = self._flux2_update_goal_latents(
+                aggregator,
+                latents,
+                txt,
+                img,
+                text_mask=text_mask,
+                cond_len=cond_len,
+                layer_idx=layer_idx,
+                num_layers=num_layers,
+            )
+            syn_k, syn_v = self._flux2_project_synthetic_kv(
+                aggregator,
+                latents,
+                layer_idx=layer_idx,
+                num_layers=num_layers,
+                pe_embedder=pe_embedder,
+            )
+            double_cache.append(
+                {
+                    "txt_k": video_k[:, :txt_len],
+                    "txt_v": video_v[:, :txt_len],
+                    "syn_k": syn_k,
+                    "syn_v": syn_v,
+                }
+            )
+
+        video_stream = torch.cat([txt, img], dim=1)
+        stream_pe = torch.cat([txt_pe, img_pe], dim=2)
+        single_cache = []
+        for local_idx in range(single_layers):
+            layer_idx = double_layers + local_idx
+            block = video_expert.single_blocks[local_idx]
+            state = self._flux2_video_single_io(block, video_stream, stream_pe, video_t_mod["single"])
+            video_attn = self._mixed_attention(state["q"], state["k"], state["v"], video_mask)
+            video_stream = block._out(state["residual_x"], video_attn, state["mlp"], state["gate"])
+            txt = video_stream[:, :txt_len]
+            img = video_stream[:, txt_len:]
+            latents = self._flux2_update_goal_latents(
+                aggregator,
+                latents,
+                txt,
+                img,
+                text_mask=text_mask,
+                cond_len=cond_len,
+                layer_idx=layer_idx,
+                num_layers=num_layers,
+            )
+            syn_k, syn_v = self._flux2_project_synthetic_kv(
+                aggregator,
+                latents,
+                layer_idx=layer_idx,
+                num_layers=num_layers,
+                pe_embedder=pe_embedder,
+            )
+            single_cache.append(
+                {
+                    "txt_k": state["k"][:, :txt_len],
+                    "txt_v": state["v"][:, :txt_len],
+                    "syn_k": syn_k,
+                    "syn_v": syn_v,
+                }
+            )
+
+        return {
+            "double": double_cache,
+            "single": single_cache,
+            "txt_len": txt_len,
+            "synthetic_len": int(latents.shape[1]),
+            "goal_latents": latents,
+            "final_video": {"txt": txt, "img": img},
+        }
+
+    def forward_flux2_action_with_goal_prior_cache(
+        self,
+        action_tokens: torch.Tensor,
+        action_ids: torch.Tensor,
+        action_t_mod: dict[str, object],
+        goal_prior_cache: dict[str, object],
+        action_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.block_protocol != "flux2":
+            raise ValueError("`forward_flux2_action_with_goal_prior_cache` requires block_protocol='flux2'.")
+        video_expert = self.mixtures["video"]
+        action_expert = self.mixtures["action"]
+        action = action_tokens
+        action_pe = video_expert.transformer.pe_embedder(action_ids.to(device=action.device, dtype=action.dtype))
+
+        def _attend(block, state, cache, mask):
+            k_cat = torch.cat(
+                [
+                    cache["txt_k"].to(dtype=state["k"].dtype),
+                    cache["syn_k"].to(dtype=state["k"].dtype),
+                    state["k"],
+                ],
+                dim=1,
+            )
+            v_cat = torch.cat(
+                [
+                    cache["txt_v"].to(dtype=state["v"].dtype),
+                    cache["syn_v"].to(dtype=state["v"].dtype),
+                    state["v"],
+                ],
+                dim=1,
+            )
+            mixed = self._mixed_attention(state["q"], k_cat, v_cat, mask)
+            return block.apply_post(mixed, state)
+
+        for layer_idx, cache in enumerate(goal_prior_cache["double"]):
+            block = action_expert.double_blocks[layer_idx]
+            state = block.prepare_qkv(action, action_pe, action_t_mod["double_img"])
+            action = _attend(block, state, cache, action_mask)
+        for layer_idx, cache in enumerate(goal_prior_cache["single"]):
+            block = action_expert.single_blocks[layer_idx]
+            state = block.prepare_qkv(action, action_pe, action_t_mod["single"])
+            action = _attend(block, state, cache, action_mask)
         return action
 
     def _forward_yak(
@@ -1104,6 +1603,16 @@ class MoT(nn.Module):
                 t_mod_all=t_mod_all,
             )
         if self.block_protocol == "flux2":
+            goal_prior = None if context_all is None else context_all.get("goal_prior")
+            mode = None if not isinstance(goal_prior, dict) else goal_prior.get("mode")
+            if mode == "stage2":
+                return self._forward_flux2_stage2(
+                    embeds_all=embeds_all,
+                    attention_mask=attention_mask,
+                    freqs_all=freqs_all,
+                    context_all=context_all,
+                    t_mod_all=t_mod_all,
+                )
             return self._forward_flux2(
                 embeds_all=embeds_all,
                 attention_mask=attention_mask,

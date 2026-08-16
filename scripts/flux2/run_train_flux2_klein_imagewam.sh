@@ -11,6 +11,7 @@ TASK_TYPE="${TASK_TYPE:-robotwin}"        # libero | robotwin
 FLUX2_VARIANT="${FLUX2_VARIANT:-4b}"      # 4b | 9b
 ZERO_STAGE="${ZERO_STAGE:-1}"             # 1 | zero1 | 2 | zero2
 PRECOMPUTE_QWEN3_CACHE="${PRECOMPUTE_QWEN3_CACHE:-false}"
+QWEN_CONTEXT_LEN="${QWEN_CONTEXT_LEN:-128}"
 USE_CLEAN_ROBOTWIN="${USE_CLEAN_ROBOTWIN:-false}"
 MODEL_ROOT="${MODEL_ROOT:-${REPO_ROOT}/checkpoints}"
 
@@ -43,7 +44,7 @@ case "${TASK_TYPE}" in
     DATASET_OVERRIDES=(
       "data.train.dataset_dirs=[${DATA_ROOT}/libero_spatial_no_noops_lerobot,${DATA_ROOT}/libero_object_no_noops_lerobot,${DATA_ROOT}/libero_goal_no_noops_lerobot,${DATA_ROOT}/libero_10_no_noops_lerobot]"
       "data.train.qwen_text_cache_dir=${QWEN_CACHE_DIR}"
-      "data.train.qwen_context_len=128"
+      "data.train.qwen_context_len=${QWEN_CONTEXT_LEN}"
       "data.train.qwen_text_cache_format=qwen3_flux2"
     )
     ;;
@@ -80,7 +81,7 @@ esac
 ACTION_INIT="${ACTION_INIT:-checkpoints/action_dit_flux2_${FLUX2_VARIANT}_${TASK_TYPE}_init.pt}"
 export PYTHONPATH="${REPO_ROOT}/src:${FLUX2_SRC}/src:${FLUX2_SRC}${PYTHONPATH:+:${PYTHONPATH}}"
 
-imagewam_print_config TASK_TYPE TASK_NAME FLUX2_VARIANT DATA_ROOT FLUX2_SRC FLUX2_MODEL_PATH FLUX2_AE_MODEL_PATH QWEN_CACHE_DIR ACTION_INIT
+imagewam_print_config TASK_TYPE TASK_NAME FLUX2_VARIANT DATA_ROOT FLUX2_SRC FLUX2_MODEL_PATH FLUX2_AE_MODEL_PATH QWEN_CACHE_DIR QWEN_CONTEXT_LEN ACTION_INIT
 
 if [ "${REBUILD_ACTION_INIT:-false}" = "true" ] || [ ! -f "${ACTION_INIT}" ]; then
   imagewam_run imagewam_python scripts/flux2/preprocess_action_dit_flux2.py \
