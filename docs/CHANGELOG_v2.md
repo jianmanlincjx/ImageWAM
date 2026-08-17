@@ -229,3 +229,47 @@ goal token 彻底离开 txt 空间,连带改 Stage1 的 MoT 调用、注意力 m
 这是两个机制一致性的机器检查,不是靠注释约定。
 
 测试总数 **52 passed**。
+
+---
+
+## 修订 4 — 可观测性,以及一个会卡死训练的分布式 bug
+
+一次改 6 项而没有消融预算,所以训练过程本身必须可解读。加了两组标量,
+都几乎零成本(需要的量本来就有):
+
+| 指标 | 回答什么问题 |
+|---|---|
+| `train/gate/bias_{mean,first,last}` | **门控活下来了吗?** bias 是可学习的,而 in-dist 训练奖励把它开大。终点若接近 0,说明 syn 通道又退化成了单纯的 augment ——「gate 而非 augment」在终点不成立。这是该主张**唯一的直接证据** |
+| `train/loss_action_fallback` vs `train/loss_action_steered` | **退路建起来了吗?** 前者是 blackout 样本(只有 `[txt \| pose \| action]`)的动作 loss。它决定 OOD 时能退回多好的策略 |
+| `train/blackout_frac` | 采样正确性的哨兵 |
+
+**顺带发现一个会卡死训练的 bug。** trainer 在
+`for key, value in loss_dict.items()` 里逐键调用 `accelerator.gather`。
+`loss_action_fallback` 原本只在"该 rank 本步有屏蔽样本"时才存在,而
+bs=10、p=0.10 时**单 rank 一步内没有屏蔽样本的概率是 0.9¹⁰ ≈ 35%** ——
+不同 rank 的键集不一致 → gather 调用次数不一致 → **NCCL 集合操作错配,挂住**。
+8 卡下几乎每步必现。
+
+两处修:
+
+1. **键恒定发出**(子集为空时回落到整体均值)
+2. **blackout 改成定量抽取**:每步每 rank 恰好 `k = round(p·B)` 个,
+   并保证 `1 ≤ k ≤ B-1`。bs=10、p=0.10 → 恒为 1(实测 1000 步全是 1)。
+   两种模式恒共存,指标恒有定义,方差也更小
+
+---
+
+## 最终状态
+
+- 测试 **59 passed**
+- 接线审计 **29/29**
+- `dark per step (bs=10) = {1}`,`gated_span = (8, 100)`
+
+### 训练时该盯什么
+
+| 时刻 | 看什么 | 判据 |
+|---|---|---|
+| 开局 1h | `loss_action` | 应远低于旧版的 **0.80**,且领先维持 > 1000 步。不达标 → 补预计算版 L_prior |
+| 全程 | `gate/bias_last` | 若快速冲到 0 以上,说明门被完全打开,B2+ 是唯一还在起作用的机制 |
+| 全程 | `loss_action_fallback` | 应持续下降并向 `loss_action_steered` 靠拢。若停在高位,说明退路没建起来,OOD 不会改善 |
+| 终点 | `loss_pose` | 旧版 raw MSE 0.00137(identity 基线 0.0709)。掉太多说明 blackout 伤到了位姿通道 |

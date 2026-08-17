@@ -435,10 +435,19 @@ class SemanticVisualAggregator(nn.Module):
             drop = torch.rand(int(batch_size), n_ctx, device=device) < self.context_token_dropout
             keep[:, self.num_pose_tokens :] = ~drop
         if self.context_blackout_prob > 0.0:
-            # Per sample, so a batch carries both the steered and the fallback
-            # regime and the Action Expert has to be competent in each.
-            blackout = torch.rand(int(batch_size), device=device) < self.context_blackout_prob
-            keep[blackout, self.num_pose_tokens :] = False
+            # Fixed count rather than an independent coin per sample: a batch
+            # then always carries both the steered and the fallback regime, so
+            # the per-regime training metrics are always defined on every rank.
+            # Ranks that disagree about which metric keys exist deadlock the
+            # trainer's per-key all-gather.
+            n = int(batch_size)
+            k = int(round(self.context_blackout_prob * n))
+            if k <= 0 and self.context_blackout_prob > 0.0:
+                k = 1 if n > 1 else 0
+            k = min(k, max(n - 1, 0))  # never black out the whole batch
+            if k > 0:
+                idx = torch.randperm(n, device=device)[:k]
+                keep[idx, self.num_pose_tokens :] = False
         return keep
 
     def visual_attn_mask(

@@ -2865,6 +2865,9 @@ class ImageWAM(torch.nn.Module):
             device=noisy_latent.device,
             text_attention_mask=video_pre["text_mask"],
         )
+        syn_keep_mask = self.semantic_visual_aggregator.sample_context_keep_mask(
+            batch_size, noisy_latent.device, training=self.training
+        )
         action_mask = build_stage2_action_attention_mask(
             batch_size=batch_size,
             txt_len=int(video_pre["txt_len"]),
@@ -2872,9 +2875,7 @@ class ImageWAM(torch.nn.Module):
             action_len=int(action_pre["tokens"].shape[1]),
             device=noisy_latent.device,
             text_attention_mask=video_pre["text_mask"],
-            synthetic_keep_mask=self.semantic_visual_aggregator.sample_context_keep_mask(
-                batch_size, noisy_latent.device, training=self.training
-            ),
+            synthetic_keep_mask=syn_keep_mask,
         )
         tokens_out = self.mot(
             embeds_all={"video": video_pre["tokens"], "action": action_pre["tokens"]},
@@ -2927,11 +2928,60 @@ class ImageWAM(torch.nn.Module):
             + self.loss_lambda_action * loss_action
             + self.loss_lambda_pose * loss_pose
         )
-        return loss_total, {
+        metrics = {
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
             "loss_pose": self.loss_lambda_pose * float(loss_pose.detach().item()),
         }
+        metrics.update(self._goal_prior_diagnostics(
+            syn_keep_mask=syn_keep_mask,
+            action_loss_per_sample=action_loss_per_sample,
+            action_weight=action_weight,
+        ))
+        return loss_total, metrics
+
+    def _goal_prior_diagnostics(
+        self,
+        *,
+        syn_keep_mask: Optional[torch.Tensor],
+        action_loss_per_sample: torch.Tensor,
+        action_weight: torch.Tensor,
+    ) -> dict[str, float]:
+        """Cheap scalars that make a six-change run self-explaining.
+
+        `gate/bias_*` shows whether the cold-start gate survived training: the
+        bias is learnable and in-distribution training rewards opening it, so a
+        value near zero at the end means the synthetic channel became a plain
+        augmentation again. `loss_action_fallback` tracks the quality of the
+        [txt | pose | action] policy that blackout builds, which is what the
+        model falls back to when a perturbation corrupts the aggregator.
+        """
+        out: dict[str, float] = {}
+        agg = getattr(self, "semantic_visual_aggregator", None)
+        if agg is None:
+            return out
+        biases = [float(g.syn_gate_bias.detach()) for g in agg.groups]
+        if biases:
+            out["gate/bias_mean"] = sum(biases) / len(biases)
+            out["gate/bias_first"] = biases[0]
+            out["gate/bias_last"] = biases[-1]
+        if syn_keep_mask is None:
+            return out
+        weighted = (action_loss_per_sample * action_weight).detach()
+        dark = ~syn_keep_mask[:, int(agg.num_pose_tokens) :].any(dim=1)
+        overall = self.loss_lambda_action * float(weighted.mean())
+        # Emit every key unconditionally. The trainer all-gathers per key, so a
+        # key present on one rank and missing on another deadlocks the step.
+        out["blackout_frac"] = float(dark.float().mean())
+        out["loss_action_fallback"] = (
+            self.loss_lambda_action * float(weighted[dark].mean()) if bool(dark.any()) else overall
+        )
+        out["loss_action_steered"] = (
+            self.loss_lambda_action * float(weighted[~dark].mean())
+            if bool((~dark).any())
+            else overall
+        )
+        return out
 
     def _training_loss_dim(self, sample, tiled: bool = False):
         inputs = self.build_inputs_dim(sample, tiled=tiled)
