@@ -717,7 +717,7 @@ class MoT(nn.Module):
     @staticmethod
     def _flux2_gate_action_mask(
         action_mask: torch.Tensor,
-        txt_len: int,
+        syn_start: int,
         synthetic_len: int,
         bias: torch.Tensor,
         gated_span: tuple[int, int] | None = None,
@@ -732,8 +732,8 @@ class MoT(nn.Module):
         lo, hi = (0, int(synthetic_len)) if gated_span is None else gated_span
         additive = torch.zeros(action_mask.shape, dtype=torch.float32, device=action_mask.device)
         additive = additive.masked_fill(~action_mask.to(torch.bool), float("-inf"))
-        start = int(txt_len) + int(lo)
-        stop = int(txt_len) + int(hi)
+        start = int(syn_start) + int(lo)
+        stop = int(syn_start) + int(hi)
         additive[..., start:stop] += bias.to(additive.dtype)
         return additive
 
@@ -803,6 +803,7 @@ class MoT(nn.Module):
         action_t_mod = t_mod_all["action"]
         text_mask = goal_prior["text_mask"].to(device=txt.device, dtype=torch.bool)
         action_mask = attention_mask["action"]
+        _sees_ref = bool(getattr(aggregator, "action_sees_ref", False))
         _gate_active = bool(
             aggregator is not None
             and any(float(g.syn_gate_bias.detach()) != 0.0 for g in aggregator.groups)
@@ -879,19 +880,26 @@ class MoT(nn.Module):
                 action_state = a_block.prepare_qkv(action_tokens, action_pe, action_double_img)
                 txt_k = video_k[:, :txt_len]
                 txt_v = video_v[:, :txt_len]
+                ref_k = video_k[:, txt_len : txt_len + cond_len] if _sees_ref else None
+                ref_v = video_v[:, txt_len : txt_len + cond_len] if _sees_ref else None
+                ref_len = int(ref_k.shape[1]) if ref_k is not None else 0
                 mixed = self._mixed_attention(
                     action_state["q"],
                     torch.cat(
-                        [txt_k.to(action_state["k"].dtype), syn_k.to(action_state["k"].dtype), action_state["k"]],
+                        [txt_k.to(action_state["k"].dtype)]
+                        + ([ref_k.to(action_state["k"].dtype)] if ref_len else [])
+                        + [syn_k.to(action_state["k"].dtype), action_state["k"]],
                         dim=1,
                     ),
                     torch.cat(
-                        [txt_v.to(action_state["v"].dtype), syn_v.to(action_state["v"].dtype), action_state["v"]],
+                        [txt_v.to(action_state["v"].dtype)]
+                        + ([ref_v.to(action_state["v"].dtype)] if ref_len else [])
+                        + [syn_v.to(action_state["v"].dtype), action_state["v"]],
                         dim=1,
                     ),
                     self._flux2_gate_action_mask(
                         action_mask,
-                        txt_len,
+                        txt_len + ref_len,
                         syn_k.shape[1],
                         aggregator.gate_bias(layer_idx, num_layers),
                         aggregator.gated_span(),
@@ -959,19 +967,26 @@ class MoT(nn.Module):
                 action_state = a_block.prepare_qkv(action_tokens, action_pe, action_single)
                 txt_k = video_state["k"][:, :txt_len]
                 txt_v = video_state["v"][:, :txt_len]
+                ref_k = video_state["k"][:, txt_len : txt_len + cond_len] if _sees_ref else None
+                ref_v = video_state["v"][:, txt_len : txt_len + cond_len] if _sees_ref else None
+                ref_len = int(ref_k.shape[1]) if ref_k is not None else 0
                 mixed = self._mixed_attention(
                     action_state["q"],
                     torch.cat(
-                        [txt_k.to(action_state["k"].dtype), syn_k.to(action_state["k"].dtype), action_state["k"]],
+                        [txt_k.to(action_state["k"].dtype)]
+                        + ([ref_k.to(action_state["k"].dtype)] if ref_len else [])
+                        + [syn_k.to(action_state["k"].dtype), action_state["k"]],
                         dim=1,
                     ),
                     torch.cat(
-                        [txt_v.to(action_state["v"].dtype), syn_v.to(action_state["v"].dtype), action_state["v"]],
+                        [txt_v.to(action_state["v"].dtype)]
+                        + ([ref_v.to(action_state["v"].dtype)] if ref_len else [])
+                        + [syn_v.to(action_state["v"].dtype), action_state["v"]],
                         dim=1,
                     ),
                     self._flux2_gate_action_mask(
                         action_mask,
-                        txt_len,
+                        txt_len + ref_len,
                         syn_k.shape[1],
                         aggregator.gate_bias(layer_idx, num_layers),
                         aggregator.gated_span(),
@@ -1208,6 +1223,8 @@ class MoT(nn.Module):
                 {
                     "txt_k": video_k[:, :txt_len],
                     "txt_v": video_v[:, :txt_len],
+                    "ref_k": video_k[:, txt_len : txt_len + cond_len],
+                    "ref_v": video_v[:, txt_len : txt_len + cond_len],
                     "syn_k": syn_k,
                     "syn_v": syn_v,
                     "gate_bias": aggregator.gate_bias(layer_idx, num_layers).detach(),
@@ -1247,6 +1264,8 @@ class MoT(nn.Module):
                 {
                     "txt_k": state["k"][:, :txt_len],
                     "txt_v": state["v"][:, :txt_len],
+                    "ref_k": state["k"][:, txt_len : txt_len + cond_len],
+                    "ref_v": state["v"][:, txt_len : txt_len + cond_len],
                     "syn_k": syn_k,
                     "syn_v": syn_v,
                     "gate_bias": aggregator.gate_bias(layer_idx, num_layers).detach(),
@@ -1254,6 +1273,13 @@ class MoT(nn.Module):
                 }
             )
 
+        mode = str(goal_prior.get("infer_mode", "firewall"))
+        if mode not in ("full", "firewall", "ref_only"):
+            raise ValueError(
+                f"goal_prior['infer_mode'] must be full/firewall/ref_only, got {mode!r}"
+            )
+        for entry in double_cache + single_cache:
+            entry["mode"] = mode
         return {
             "double": double_cache,
             "single": single_cache,
@@ -1279,33 +1305,36 @@ class MoT(nn.Module):
         action_pe = video_expert.transformer.pe_embedder(action_ids.to(device=action.device, dtype=action.dtype))
 
         def _attend(block, state, cache, mask):
+            # `mode` is stamped on the cache at prefill, so one checkpoint can be
+            # scored with either channel, both, or neither.
+            mode = str(cache.get("mode", "firewall"))
+            use_ref = mode in ("full", "ref_only") and cache.get("ref_k") is not None
+            use_syn = mode in ("full", "firewall")
+            ref_len = int(cache["ref_k"].shape[1]) if use_ref else 0
+
+            keys = [cache["txt_k"].to(dtype=state["k"].dtype)]
+            vals = [cache["txt_v"].to(dtype=state["v"].dtype)]
+            if use_ref:
+                keys.append(cache["ref_k"].to(dtype=state["k"].dtype))
+                vals.append(cache["ref_v"].to(dtype=state["v"].dtype))
+            if use_syn:
+                keys.append(cache["syn_k"].to(dtype=state["k"].dtype))
+                vals.append(cache["syn_v"].to(dtype=state["v"].dtype))
+            keys.append(state["k"])
+            vals.append(state["v"])
+
             bias = cache.get("gate_bias")
-            if bias is not None and float(bias) != 0.0:
-                # txt_len is not in scope here; the cache carries it.
+            if use_syn and bias is not None and float(bias) != 0.0:
                 mask = self._flux2_gate_action_mask(
                     mask,
-                    cache["txt_k"].shape[1],
-                    cache["syn_k"].shape[1],
+                    cache["txt_k"].shape[1] + ref_len,
+                    int(cache["syn_k"].shape[1]),
                     bias,
                     cache.get("gated_span"),
                 )
-            k_cat = torch.cat(
-                [
-                    cache["txt_k"].to(dtype=state["k"].dtype),
-                    cache["syn_k"].to(dtype=state["k"].dtype),
-                    state["k"],
-                ],
-                dim=1,
+            mixed = self._mixed_attention(
+                state["q"], torch.cat(keys, dim=1), torch.cat(vals, dim=1), mask
             )
-            v_cat = torch.cat(
-                [
-                    cache["txt_v"].to(dtype=state["v"].dtype),
-                    cache["syn_v"].to(dtype=state["v"].dtype),
-                    state["v"],
-                ],
-                dim=1,
-            )
-            mixed = self._mixed_attention(state["q"], k_cat, v_cat, mask)
             return block.apply_post(mixed, state)
 
         for layer_idx, cache in enumerate(goal_prior_cache["double"]):

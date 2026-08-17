@@ -43,6 +43,14 @@ GOAL_PRIOR_SYN_GATE_BIAS_INIT = 0.0  # set to about -5.0 to cold-start
 # with what B2+ blackout falls back to. True reproduces the older behaviour of
 # gating the whole synthetic block.
 GOAL_PRIOR_GATE_POSE_TOKENS = False
+# Plan B. The Action Expert attends the reference image again, and training
+# samples which channels it may use. Probabilities must sum to 1; "both" is the
+# inference condition, "syn only" preserves firewall mode as an evaluable
+# capability rather than an architectural constraint.
+GOAL_PRIOR_ACTION_SEES_REF = False
+GOAL_PRIOR_P_BOTH = 0.55
+GOAL_PRIOR_P_REF_ONLY = 0.15
+GOAL_PRIOR_P_SYN_ONLY = 0.30
 # B1: "free" = 100 unconstrained latents attending the whole image (evaluated
 # behaviour). "grid" ties the context latents to a coarse spatial grid and lets
 # each one attend only its own neighbourhood, so a global perturbation can no
@@ -321,6 +329,10 @@ class SemanticVisualAggregator(nn.Module):
         grid_hw: Sequence[int] = GOAL_PRIOR_GRID_HW,
         grid_window: int = GOAL_PRIOR_GRID_WINDOW,
         gate_pose_tokens: bool = GOAL_PRIOR_GATE_POSE_TOKENS,
+        action_sees_ref: bool = GOAL_PRIOR_ACTION_SEES_REF,
+        p_both: float = GOAL_PRIOR_P_BOTH,
+        p_ref_only: float = GOAL_PRIOR_P_REF_ONLY,
+        p_syn_only: float = GOAL_PRIOR_P_SYN_ONLY,
     ):
         super().__init__()
         self.num_tokens = int(num_tokens)
@@ -339,6 +351,19 @@ class SemanticVisualAggregator(nn.Module):
             raise ValueError(
                 f"`context_blackout_prob` must be in [0, 1), got {context_blackout_prob}"
             )
+        self.action_sees_ref = bool(action_sees_ref)
+        self.p_both = float(p_both)
+        self.p_ref_only = float(p_ref_only)
+        self.p_syn_only = float(p_syn_only)
+        if self.action_sees_ref:
+            total = self.p_both + self.p_ref_only + self.p_syn_only
+            if abs(total - 1.0) > 1e-6:
+                raise ValueError(
+                    "channel regime probabilities must sum to 1, got "
+                    f"{self.p_both}+{self.p_ref_only}+{self.p_syn_only}={total}"
+                )
+            if min(self.p_both, self.p_ref_only, self.p_syn_only) < 0.0:
+                raise ValueError("channel regime probabilities must be non-negative")
         self.gate_pose_tokens = bool(gate_pose_tokens)
         if bool(zero_init_value) and not self.gate_pose_tokens:
             # `to_value` is one Linear shared by every synthetic token, so there
@@ -449,6 +474,41 @@ class SemanticVisualAggregator(nn.Module):
                 idx = torch.randperm(n, device=device)[:k]
                 keep[idx, self.num_pose_tokens :] = False
         return keep
+
+    def sample_channel_regime(
+        self,
+        batch_size: int,
+        device: torch.device,
+        training: Optional[bool] = None,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Plan B. Per-sample (ref_keep, syn_keep) booleans, or (None, None).
+
+        Fixed counts rather than independent coins: every rank then sees every
+        regime in every batch, so the per-regime training metrics are always
+        defined. Ranks that disagree about which metric keys exist deadlock the
+        trainer's per-key all-gather.
+        """
+        if training is None:
+            training = self.training
+        if not self.action_sees_ref or not training:
+            return None, None
+        n = int(batch_size)
+        if n <= 0:
+            return None, None
+        n_ref_only = int(round(self.p_ref_only * n))
+        n_syn_only = int(round(self.p_syn_only * n))
+        if n >= 3:  # keep every regime represented
+            n_ref_only = max(1, min(n_ref_only, n - 2))
+            n_syn_only = max(1, min(n_syn_only, n - 1 - n_ref_only))
+        else:
+            n_ref_only = min(n_ref_only, n)
+            n_syn_only = min(n_syn_only, n - n_ref_only)
+        order = torch.randperm(n, device=device)
+        ref_keep = torch.ones(n, dtype=torch.bool, device=device)
+        syn_keep = torch.ones(n, dtype=torch.bool, device=device)
+        ref_keep[order[:n_syn_only]] = False                       # syn-only samples
+        syn_keep[order[n_syn_only : n_syn_only + n_ref_only]] = False  # ref-only samples
+        return ref_keep, syn_keep
 
     def visual_attn_mask(
         self,
@@ -576,13 +636,20 @@ def build_stage2_action_attention_mask(
     device: torch.device,
     text_attention_mask: Optional[torch.Tensor] = None,
     synthetic_keep_mask: Optional[torch.Tensor] = None,
+    ref_len: int = 0,
+    ref_keep_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Action queries attend to valid text/state, all synthetic tokens, and action self."""
-    key_len = int(txt_len) + int(synthetic_len) + int(action_len)
+    """Action queries attend text/state, the reference image, the synthetic
+    tokens, and themselves. Layout is [txt | ref | syn | action]; `ref_len=0`
+    reproduces the firewalled layout exactly."""
+    ref_len = int(ref_len)
+    syn_start = int(txt_len) + ref_len
+    key_len = syn_start + int(synthetic_len) + int(action_len)
     mask = torch.zeros(batch_size, action_len, key_len, dtype=torch.bool, device=device)
     mask[:, :, :txt_len] = True
-    mask[:, :, txt_len : txt_len + synthetic_len] = True
-    mask[:, :, txt_len + synthetic_len :] = True
+    mask[:, :, txt_len:syn_start] = True
+    mask[:, :, syn_start : syn_start + synthetic_len] = True
+    mask[:, :, syn_start + synthetic_len :] = True
     if text_attention_mask is not None:
         if text_attention_mask.ndim != 2 or tuple(text_attention_mask.shape) != (batch_size, txt_len):
             raise ValueError(
@@ -601,7 +668,17 @@ def build_stage2_action_attention_mask(
                 f"synthetic_len={synthetic_len}"
             )
         keep = synthetic_keep_mask.to(device=device, dtype=torch.bool)[:, None, :]
-        mask[:, :, txt_len : txt_len + synthetic_len] &= keep
+        mask[:, :, syn_start : syn_start + synthetic_len] &= keep
+    if ref_keep_mask is not None:
+        if ref_len <= 0:
+            raise ValueError("`ref_keep_mask` given but `ref_len` is 0")
+        if ref_keep_mask.ndim != 1 or int(ref_keep_mask.shape[0]) != batch_size:
+            raise ValueError(
+                f"`ref_keep_mask` must be [B]={batch_size}, got {tuple(ref_keep_mask.shape)}"
+            )
+        mask[:, :, txt_len:syn_start] &= ref_keep_mask.to(
+            device=device, dtype=torch.bool
+        )[:, None, None]
     return mask
 
 

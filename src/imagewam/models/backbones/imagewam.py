@@ -114,6 +114,7 @@ class ImageWAM(torch.nn.Module):
             GOAL_PRIOR_NUM_GOAL_TOKENS,
             GOAL_PRIOR_NUM_GROUPS,
             GOAL_PRIOR_NUM_LATENTS,
+            GOAL_PRIOR_ACTION_SEES_REF,
             GOAL_PRIOR_CONTEXT_BLACKOUT_PROB,
             GOAL_PRIOR_CONTEXT_TOKEN_DROPOUT,
             GOAL_PRIOR_GATE_POSE_TOKENS,
@@ -203,6 +204,10 @@ class ImageWAM(torch.nn.Module):
             zero_init_value=bool(cfg.get("zero_init_value", GOAL_PRIOR_ZERO_INIT_VALUE)),
             gate_bias_init=float(cfg.get("syn_gate_bias_init", GOAL_PRIOR_SYN_GATE_BIAS_INIT)),
             gate_pose_tokens=bool(cfg.get("gate_pose_tokens", GOAL_PRIOR_GATE_POSE_TOKENS)),
+            action_sees_ref=bool(cfg.get("action_sees_ref", GOAL_PRIOR_ACTION_SEES_REF)),
+            p_both=float(cfg.get("p_both", 0.55)),
+            p_ref_only=float(cfg.get("p_ref_only", 0.15)),
+            p_syn_only=float(cfg.get("p_syn_only", 0.30)),
             latent_layout=str(cfg.get("latent_layout", GOAL_PRIOR_LATENT_LAYOUT)),
             grid_hw=tuple(cfg.get("grid_hw", GOAL_PRIOR_GRID_HW)),
             grid_window=int(cfg.get("grid_window", GOAL_PRIOR_GRID_WINDOW)),
@@ -236,6 +241,10 @@ class ImageWAM(torch.nn.Module):
             if module is None:
                 continue
             params.extend(param for param in module.parameters() if (not trainable_only or param.requires_grad))
+        # A bare Parameter rather than a module, so it has to be listed by hand.
+        null_tokens = getattr(self, "stage1_null_image_tokens", None)
+        if null_tokens is not None and (not trainable_only or null_tokens.requires_grad):
+            params.append(null_tokens)
         return params
 
     @classmethod
@@ -2865,17 +2874,34 @@ class ImageWAM(torch.nn.Module):
             device=noisy_latent.device,
             text_attention_mask=video_pre["text_mask"],
         )
-        syn_keep_mask = self.semantic_visual_aggregator.sample_context_keep_mask(
-            batch_size, noisy_latent.device, training=self.training
+        agg = self.semantic_visual_aggregator
+        # Deliberately not `training=self.training`: the trainer never calls
+        # .train() on this top-level module, so that flag is False for the whole
+        # run and would silently disable every dropout below. The aggregator is
+        # put in train mode by `apply_trainable_policy`, so its own flag is the
+        # one that reflects reality.
+        syn_keep_mask = agg.sample_context_keep_mask(batch_size, noisy_latent.device)
+        ref_keep, syn_channel_keep = agg.sample_channel_regime(
+            batch_size, noisy_latent.device
         )
+        if syn_channel_keep is not None:
+            # A sample in the ref-only regime loses every synthetic column; this
+            # composes with the context blackout above rather than replacing it.
+            if syn_keep_mask is None:
+                syn_keep_mask = torch.ones(
+                    batch_size, int(agg.num_tokens), dtype=torch.bool, device=noisy_latent.device
+                )
+            syn_keep_mask = syn_keep_mask & syn_channel_keep[:, None]
         action_mask = build_stage2_action_attention_mask(
             batch_size=batch_size,
             txt_len=int(video_pre["txt_len"]),
-            synthetic_len=int(self.semantic_visual_aggregator.num_tokens),
+            synthetic_len=int(agg.num_tokens),
             action_len=int(action_pre["tokens"].shape[1]),
             device=noisy_latent.device,
             text_attention_mask=video_pre["text_mask"],
             synthetic_keep_mask=syn_keep_mask,
+            ref_len=int(video_pre["cond_len"]) if agg.action_sees_ref else 0,
+            ref_keep_mask=ref_keep,
         )
         tokens_out = self.mot(
             embeds_all={"video": video_pre["tokens"], "action": action_pre["tokens"]},
@@ -2886,7 +2912,7 @@ class ImageWAM(torch.nn.Module):
                 "action": {"ids": action_pre["ids"]},
                 "goal_prior": {
                     "mode": "stage2",
-                    "aggregator": self.semantic_visual_aggregator,
+                    "aggregator": agg,
                     "text_mask": video_pre["text_mask"],
                     "cond_len": int(video_pre["cond_len"]),
                     "target_len": int(video_pre["target_len"]),
@@ -2937,6 +2963,8 @@ class ImageWAM(torch.nn.Module):
             syn_keep_mask=syn_keep_mask,
             action_loss_per_sample=action_loss_per_sample,
             action_weight=action_weight,
+            ref_keep=ref_keep,
+            syn_channel_keep=syn_channel_keep,
         ))
         return loss_total, metrics
 
@@ -2946,6 +2974,8 @@ class ImageWAM(torch.nn.Module):
         syn_keep_mask: Optional[torch.Tensor],
         action_loss_per_sample: torch.Tensor,
         action_weight: torch.Tensor,
+        ref_keep: Optional[torch.Tensor] = None,
+        syn_channel_keep: Optional[torch.Tensor] = None,
     ) -> dict[str, float]:
         """Cheap scalars that make a six-change run self-explaining.
 
@@ -2981,6 +3011,22 @@ class ImageWAM(torch.nn.Module):
             if bool((~dark).any())
             else overall
         )
+        if ref_keep is not None and syn_channel_keep is not None:
+            # One number per training regime. `syn_only` is the firewall
+            # condition, so its curve is the live read on what the steering
+            # channel carries on its own -- the claim the thesis rests on.
+            regimes = {
+                "both": ref_keep & syn_channel_keep,
+                "ref_only": ref_keep & ~syn_channel_keep,
+                "syn_only": ~ref_keep & syn_channel_keep,
+            }
+            for name, sel in regimes.items():
+                out[f"regime/frac_{name}"] = float(sel.float().mean())
+                out[f"regime/loss_{name}"] = (
+                    self.loss_lambda_action * float(weighted[sel].mean())
+                    if bool(sel.any())
+                    else overall
+                )
         return out
 
     def _training_loss_dim(self, sample, tiled: bool = False):
@@ -4189,6 +4235,29 @@ class ImageWAM(torch.nn.Module):
 
         return {"action": latents_action[0].detach().to(device="cpu", dtype=torch.float32)}
 
+    def _resolve_infer_mode(self) -> str:
+        """Which channels the Action Expert may attend at inference.
+
+        Defaults to the condition the model was trained to deploy in: `full`
+        once the reference channel exists, `firewall` for a checkpoint trained
+        without it. IMAGEWAM_INFER_MODE overrides for the ablation numbers.
+        """
+        import os
+
+        agg = getattr(self, "semantic_visual_aggregator", None)
+        default = "full" if getattr(agg, "action_sees_ref", False) else "firewall"
+        mode = os.environ.get("IMAGEWAM_INFER_MODE", "").strip().lower() or default
+        if mode not in ("full", "firewall", "ref_only"):
+            raise ValueError(
+                f"IMAGEWAM_INFER_MODE must be full/firewall/ref_only, got {mode!r}"
+            )
+        if mode in ("full", "ref_only") and not getattr(agg, "action_sees_ref", False):
+            raise ValueError(
+                f"IMAGEWAM_INFER_MODE={mode!r} needs a checkpoint trained with "
+                "action_sees_ref=true; this one was not."
+            )
+        return mode
+
     @torch.no_grad()
     def _infer_action_flux2_stage1(
         self,
@@ -4353,7 +4422,9 @@ class ImageWAM(torch.nn.Module):
             device=latents_action.device,
             text_attention_mask=video_pre["text_mask"],
         )
+        infer_mode = self._resolve_infer_mode()
         goal_prior = {
+            "infer_mode": infer_mode,
             "mode": "stage2",
             "aggregator": self.semantic_visual_aggregator,
             "text_mask": video_pre["text_mask"],
@@ -4370,10 +4441,17 @@ class ImageWAM(torch.nn.Module):
         action_mask = build_stage2_action_attention_mask(
             batch_size=batch_size,
             txt_len=int(video_pre["txt_len"]),
-            synthetic_len=int(goal_prior_cache["synthetic_len"]),
+            synthetic_len=(
+                int(goal_prior_cache["synthetic_len"])
+                if infer_mode in ("full", "firewall")
+                else 0
+            ),
             action_len=int(latents_action.shape[1]),
             device=latents_action.device,
             text_attention_mask=video_pre["text_mask"],
+            ref_len=(
+                int(video_pre["cond_len"]) if infer_mode in ("full", "ref_only") else 0
+            ),
         )
         for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
             timestep_action = step_t_action.expand(batch_size).to(dtype=latents_action.dtype, device=self.device)
@@ -5161,6 +5239,8 @@ class ImageWAM(torch.nn.Module):
             payload["proprio_encoder"] = self.proprio_encoder.state_dict()
         if self.goal_pose_encoder is not None:
             payload["goal_pose_encoder"] = self.goal_pose_encoder.state_dict()
+        if getattr(self, "stage1_null_image_tokens", None) is not None:
+            payload["stage1_null_image_tokens"] = self.stage1_null_image_tokens.detach().cpu()
         if self.semantic_visual_aggregator is not None:
             payload["semantic_visual_aggregator"] = self.semantic_visual_aggregator.state_dict()
         if self.semantic_visual_pose_norm is not None:
@@ -5248,6 +5328,21 @@ class ImageWAM(torch.nn.Module):
                 result = module.load_state_dict(payload[key], strict=False)
                 missing.extend(f"{key}.{name}" for name in result.missing_keys)
                 unexpected.extend(f"{key}.{name}" for name in result.unexpected_keys)
+            null_tokens = getattr(self, "stage1_null_image_tokens", None)
+            if null_tokens is not None:
+                saved = payload.get("stage1_null_image_tokens")
+                if saved is None:
+                    missing.append("stage1_null_image_tokens")
+                elif tuple(saved.shape) != tuple(null_tokens.shape):
+                    raise ValueError(
+                        "`stage1_null_image_tokens` shape mismatch: checkpoint "
+                        f"{tuple(saved.shape)} vs model {tuple(null_tokens.shape)}"
+                    )
+                else:
+                    with torch.no_grad():
+                        null_tokens.copy_(saved.to(device=null_tokens.device, dtype=null_tokens.dtype))
+            elif "stage1_null_image_tokens" in payload:
+                unexpected.append("stage1_null_image_tokens")
             validate_goal_prior_checkpoint_keys(
                 current_stage=current_stage,
                 payload_stage=payload_stage,

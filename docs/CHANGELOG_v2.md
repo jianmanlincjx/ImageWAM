@@ -273,3 +273,93 @@ bs=10、p=0.10 时**单 rank 一步内没有屏蔽样本的概率是 0.9¹⁰ �
 | 全程 | `gate/bias_last` | 若快速冲到 0 以上,说明门被完全打开,B2+ 是唯一还在起作用的机制 |
 | 全程 | `loss_action_fallback` | 应持续下降并向 `loss_action_steered` 靠拢。若停在高位,说明退路没建起来,OOD 不会改善 |
 | 终点 | `loss_pose` | 旧版 raw MSE 0.00137(identity 基线 0.0709)。掉太多说明 blackout 伤到了位姿通道 |
+
+---
+
+# 方案 B —— AE 恢复 ref 通路,firewall 降级为正则化
+
+## 为什么改
+
+全量 LIBERO-Plus(10,030 任务,两模型同一子集,逐 trial 配对):
+
+| 类别 | n | baseline | ours | Δ | p |
+|---|---:|---:|---:|---:|---:|
+| Robot Initial States | 1550 | 48.58% | **58.65%** | **+10.06** | 0.0000 |
+| Background Textures | 1076 | 89.03% | **91.91%** | **+2.88** | 0.0247 |
+| Objects Layout | 1525 | 78.49% | 79.34% | +0.85 | 0.393 |
+| Light Conditions | 1142 | 98.42% | 96.06% | −2.36 | 0.0007 |
+| Sensor Noise | 1601 | 97.31% | 92.19% | −5.12 | 0.0000 |
+| Language Instructions | 1537 | 91.74% | 79.64% | −12.10 | 0.0000 |
+| Camera Viewpoints | 1599 | 82.93% | 68.29% | −14.63 | 0.0000 |
+| **合计** | 10030 | **83.01%** | **79.73%** | **−3.28** | 0.0000 |
+| 剔除 Language | 8493 | 81.43% | 79.75% | **−1.68** | **0.0001** |
+
+**注意**:部分数据时"剔除 Language 后不显著"(p=0.11),补满到 8493 后变成 **p=0.0001**。
+幅度小了一半但不能说无差异 —— 早期读数会骗人。
+
+**诊断**:ImageWAM 的 baseline 在完全能看像素时 Sensor Noise 97.3%、Light 98.4% ——
+它的骨干**本身是去噪器**(`0.5·L_image` 联合训练),ActionDiT 又是 FLUX 权重插值初始化。
+**firewall 在解决一个这个宿主上不存在的问题,却拿走了 AE 赖以鲁棒的冗余。**
+
+## 改成什么
+
+```
+推理:  [txt | ref(784) | syn(100) | action]     ← 默认,两条通道都在
+训练:  都开 0.55 │ 只 ref 0.15 │ 只 syn 0.30
+```
+
+两条通道都不可靠 → AE 必须建立冗余。保留 syn-only 状态意味着**同一个 checkpoint
+可以切到 firewall 模式**,firewall 从架构约束变成**可评测的能力**:
+
+| 模式 | AE 看到 | 回答 |
+|---|---|---|
+| Full(默认) | txt + ref + syn | 有没有伤害宿主 |
+| Firewall | txt + syn | steering 通道自己扛得动多少 —— thesis 的核心数 |
+| Ref-only | txt + ref | 对照 |
+
+参数调整:`syn_gate_bias_init −5 → −2`(key 数 629→1413,分母翻倍,−5 会让 context
+的注意力质量掉到 ~0.04%)、`context_token_dropout 0.15 → 0.05`(通道级 dropout
+已提供更强的独立性压力,再叠加只会加重训练/推理错配)。`context_blackout_prob 0.10` 保留 ——
+它保证 8 个 pose token 承重,否则 92 个自由 latent 会把信息全揽过去,
+"pose-based steering" 在实现上就不成立。
+
+---
+
+## Smoke 抓到的两个 bug —— 都只在真实训练里暴露
+
+### ① A2 的 null-image token 是死的
+
+`stage1_null_image_tokens` 既不在 `goal_prior_parameters()`(→ **不在优化器里,永远不更新**)
+也不在保存的 payload 里(→ 无法 resume)。配置里写的是"可学习",实际是个冻结的随机常量。
+已修三处:优化器、保存、加载(含 fail-closed 白名单)。
+
+### ② 所有 dropout 机制在训练时静默失效 ← 更严重
+
+trainer **只调用 `model.dit.train()` 和 `proprio_encoder.train()`,从不对顶层 ImageWAM
+调 `.train()`**,所以 `self.training` 全程是 `False`。我在调用点传了 `training=self.training`,
+于是**三态采样、context blackout、逐 token dropout 全部返回 None** ——
+配置全对、日志无异常、`gate/bias` 照常记录,但三态和 blackout 指标一个都没有。
+
+**不做 smoke 的话,35 小时训出来的会是"旧版失败配置 + 一条 ref 通路",
+所有新机制一个都没生效。**
+
+改为跟随 aggregator 自己的模式(`apply_trainable_policy` 确实把它设成了 train)——
+这本来就是这些方法默认值的设计意图,是我在调用点覆盖掉了。
+
+---
+
+## 状态
+
+- 测试 **71 passed**,接线审计 **41/41**
+- Stage1 smoke 通过,`stage1_null_image_tokens (32, 128)` 正确落盘
+- Stage2 smoke 通过 4 步,验证 ref 拼接 / gate 偏移 / 三态 mask 在真实前向可用
+
+## 训练时的判读
+
+| 指标 | 看什么 |
+|---|---|
+| `gate/bias_last` | 门有没有被 in-dist 训练开满。终点接近 0 = syn 又变回单纯的 augment |
+| `regime/loss_syn_only` | **firewall 模式的实时读数** —— thesis 的核心主张 |
+| `regime/loss_ref_only` | 我们有没有伤到宿主原有能力 |
+| `loss_action_fallback` | pose-only 兜底的质量 |
+| `blackout_frac` / `regime/frac_*` | 采样正确性哨兵 |

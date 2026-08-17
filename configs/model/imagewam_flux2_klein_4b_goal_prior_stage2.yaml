@@ -27,7 +27,7 @@ goal_prior:
   # B2. Drop whole context columns from the Action Expert's view each step so it
   # cannot lean on a single aggregate. Pose tokens are never dropped.
   # Targets Language Instructions (-14.0 pp; discordant +1/-52 on libero_10).
-  context_token_dropout: 0.15
+  context_token_dropout: 0.05
   # Mask the whole context block for 10% of samples. The fallback state is
   # [txt | pose | action], i.e. Stage 1's prior interface. Kept low because the
   # context block is load-bearing -- removing it outright hurt on MolmoAct2, and
@@ -40,7 +40,7 @@ goal_prior:
   # split gate the cold start is carried by the logit bias alone (-5 suppresses
   # the context columns about 150x, and it is learnable so it can open).
   zero_init_value: false
-  syn_gate_bias_init: -5.0
+  syn_gate_bias_init: -2.0
   # Gate the 92 context columns only. The 8 pose columns stay open, so step 0
   # reproduces Stage 1's [txt | pose | action] topology instead of running a
   # pose-conditioned prior with no pose at all -- and it matches the state B2+
@@ -53,6 +53,18 @@ goal_prior:
   latent_layout: free
   grid_hw: [7, 7]
   grid_window: 1
+
+  # --- plan B: the Action Expert sees the reference image again --------------
+  # The firewall stops being an architectural constraint and becomes a
+  # regulariser: training samples which channels are visible, so neither is
+  # reliable and the policy has to work from either. That redundancy is what
+  # makes the baseline robust and what the hard firewall removed. Keeping a
+  # syn-only regime means this same checkpoint can still be scored in firewall
+  # mode, which is the number the thesis actually claims.
+  action_sees_ref: true
+  p_both: 0.55        # the deployment condition
+  p_ref_only: 0.15    # breaks dependence on the synthetic channel
+  p_syn_only: 0.30    # keeps firewall mode trained well enough to report
 
 flux2_lora_config:
   enabled: false
