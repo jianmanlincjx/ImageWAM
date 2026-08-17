@@ -151,3 +151,81 @@ LR 保持 2e-4 不降,抵消 batch 减半。
   (旧版是开局 0.80、step 100 被 baseline 反超)。不达标 → 补预计算版 L_prior
 - **B2+**:Camera Viewpoints / Sensor Noise 回到不劣于 baseline
 - **B2+**:Language 的配对不再单向(旧版 libero_10 上是 **+1 / −52**)
+
+---
+
+## 修订 1 — 门控只作用于 context,pose 保持常开
+
+**发现的不一致**:B4 原本把门控加在全部 100 列上,于是 Stage2 在 step 0 时
+AE 看到的是 `[txt | (syn 全关) | action]`。但 Stage1 的先验是
+`π(a | txt, goal_tokens)` —— **位姿条件的**。把 syn 整个关掉,等于用一个
+从未见过的输入(没有位姿)去跑一个位姿条件策略,**正是我们测到过的
+"权重保住了、功能没保住"**。
+
+而且它和 B2+ 自相矛盾:blackout 的兜底状态保留 pose,B4 的冷启动却把 pose 也关了。
+
+**改法**:`gate_pose_tokens: false`。门控只覆盖 92 个 context 列。
+
+| 通道 | 门控 | step 0 |
+|---|---|---|
+| pose(8) | 无 | 常开,携带推断位姿 |
+| context(92) | logit bias −5 | 关闭,需自己挣到位置 |
+
+三件事一次对齐:step-0 拓扑 = Stage1 先验接口;与 B2+ 兜底状态一致;
+字面落实 "gate 而非 augment"(pose 是 steering 信号本身,context 才是 augment)。
+
+**连带修正**:`zero_init_value` 必须设为 `false`。`to_value` 是所有 syn token
+**共用**的一个 Linear,没有逐 token 结构,零初始化会把 pose 的 value 也清零 ——
+split gate 就成了摆设。现在这个矛盾组合会**直接报错**而不是静默失效。
+冷启动完全由 logit bias 承担(−5 约压制 150 倍,且可学习)。
+
+---
+
+## 修订 2 — A3 取消
+
+**A3 与 B4 在目标上互相抵消**:A3 要让 syn 通道在 step 0 是"训练过的接口",
+B4 要让它是"彻底的 no-op"。同时开启的话,B4 会在第一步把 A3 训出来的投影全部关掉。
+
+另外实现中发现维度对不上:`GoalPoseEncoder` 输出 3072(FLUX txt 空间),
+而 `to_key/to_value` 接收 768。共享投影要把 goal encoder 改成 768,
+goal token 彻底离开 txt 空间,连带改 Stage1 的 MoT 调用、注意力 mask、
+`collect_trainable_parameters`、bridge 映射。
+
+而收益只有 5 组投影 ≈ 23.6M 参数(占 165M aggregator 的 14%),
+且**输入分布完全不同**(Stage1 喂 oracle 位姿 latent,Stage2 喂新初始化聚合器的输出)。
+
+**结论**:先验活在 ActionDiT 里,不活在 syn 投影里。B4 是直接机制,A3 是被它抵消的
+间接替代。取消 A3。
+
+---
+
+## 修订 3 — 两个 float mask 的运行期 bug
+
+门控产出的是 float 加性 mask(这是唯一能真正不吃 softmax 质量的做法),
+但代码里有两处只考虑了 bool mask:
+
+1. **`return_attn_probs` 路径会崩** —— `scores.masked_fill(~attn_mask, ...)`,
+   而 `~float_tensor` 抛
+   `TypeError: ~ (operator.invert) is only implemented on integer and Boolean-type tensors`。
+   **已实测确认。** 这条路径正是注意力捕获用的,也就是探针 D2/P3 要走的路。
+   改成 float mask 时走加法。
+2. **SDPA dtype** —— float32 mask 配 bf16 query。**实测这个 PyTorch 版本不报错**,
+   我原本断言会炸是错的。cast 保留为防御性:`mot_force_flash_attention` 若被打开,
+   flash 后端对 dtype 严格;显式 cast 也避免整个注意力被隐式提升到 float32。
+
+新增 `tests/test_mixed_attention_gate.py`,用真实张量过一遍注意力
+(bf16 端到端、强负 bias 等价于硬屏蔽、注意力捕获、bool 路径不回归)——
+这两个 bug 在 mask 层面的测试里抓不到。
+
+---
+
+## 接线审计
+
+`scripts/audit_goal_prior_v2.py` —— 从 YAML 构出模型,逐项验证配置真的生效。
+**29 项全过**。其中最关键的一条:
+
+> B2+ 的兜底状态与 B4 的 step-0 状态,**留活的恰好是同 8 个 pose 列**。
+
+这是两个机制一致性的机器检查,不是靠注释约定。
+
+测试总数 **52 passed**。

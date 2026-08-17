@@ -38,6 +38,11 @@ GOAL_PRIOR_CONTEXT_BLACKOUT_PROB = 0.0
 # its attention logits down so it also consumes no softmax mass at step 0.
 GOAL_PRIOR_ZERO_INIT_VALUE = False
 GOAL_PRIOR_SYN_GATE_BIAS_INIT = 0.0  # set to about -5.0 to cold-start
+# Whether the cold-start gate also covers the 8 pose columns. False keeps them
+# open, so step 0 matches Stage 1's [txt | pose | action] topology and agrees
+# with what B2+ blackout falls back to. True reproduces the older behaviour of
+# gating the whole synthetic block.
+GOAL_PRIOR_GATE_POSE_TOKENS = False
 # B1: "free" = 100 unconstrained latents attending the whole image (evaluated
 # behaviour). "grid" ties the context latents to a coarse spatial grid and lets
 # each one attend only its own neighbourhood, so a global perturbation can no
@@ -257,9 +262,14 @@ class SemanticVisualAggregatorGroup(nn.Module):
         self.to_key = nn.Linear(latent_dim, kv_dim, bias=False)
         self.to_value = nn.Linear(latent_dim, kv_dim, bias=False)
         self.key_norm = _RMSNorm(self.attn_head_dim)
-        # B4. Zeroing `to_value` alone is not enough: the synthetic columns would
+        # B4. Zeroing `to_value` alone is not enough: the gated columns would
         # still take softmax mass away from text and action. The learnable logit
-        # bias is what makes the channel a true no-op at initialisation.
+        # bias is what makes them a true no-op at initialisation.
+        #
+        # `to_value` is shared across all synthetic tokens, so zeroing it would
+        # also silence the pose columns we deliberately keep open. The gate is
+        # therefore carried entirely by the logit bias, which is applied per
+        # column range by the caller.
         if bool(zero_init_value):
             nn.init.zeros_(self.to_value.weight)
         self.syn_gate_bias = nn.Parameter(torch.tensor(float(gate_bias_init)))
@@ -310,6 +320,7 @@ class SemanticVisualAggregator(nn.Module):
         latent_layout: str = GOAL_PRIOR_LATENT_LAYOUT,
         grid_hw: Sequence[int] = GOAL_PRIOR_GRID_HW,
         grid_window: int = GOAL_PRIOR_GRID_WINDOW,
+        gate_pose_tokens: bool = GOAL_PRIOR_GATE_POSE_TOKENS,
     ):
         super().__init__()
         self.num_tokens = int(num_tokens)
@@ -327,6 +338,17 @@ class SemanticVisualAggregator(nn.Module):
         if not 0.0 <= self.context_blackout_prob < 1.0:
             raise ValueError(
                 f"`context_blackout_prob` must be in [0, 1), got {context_blackout_prob}"
+            )
+        self.gate_pose_tokens = bool(gate_pose_tokens)
+        if bool(zero_init_value) and not self.gate_pose_tokens:
+            # `to_value` is one Linear shared by every synthetic token, so there
+            # is no way to zero it for the context columns only -- it would
+            # silence the pose columns we are deliberately keeping open and the
+            # split gate would be decorative. Carry the gate with the logit bias.
+            raise ValueError(
+                "`zero_init_value=True` silences every synthetic column, which "
+                "contradicts `gate_pose_tokens=False`. Either gate the pose "
+                "tokens too, or rely on `gate_bias_init` alone."
             )
         self.latent_layout = str(latent_layout)
         if self.latent_layout not in ("free", "grid"):
@@ -372,8 +394,20 @@ class SemanticVisualAggregator(nn.Module):
         return self.queries.unsqueeze(0).expand(int(batch_size), -1, -1).contiguous()
 
     def gate_bias(self, layer_idx: int, num_layers: int) -> torch.Tensor:
-        """B4. Additive logit bias for this layer's synthetic columns."""
+        """B4. Additive logit bias for this layer's *gated* synthetic columns."""
         return self.groups[self.layer_group_index(layer_idx, num_layers)].syn_gate_bias
+
+    def gated_span(self) -> tuple[int, int]:
+        """Half-open [start, end) of synthetic columns the gate covers.
+
+        Pose columns stay open so that step 0 reproduces Stage 1's topology
+        [txt | pose | action]; only the context block is cold-started. This is
+        also exactly the state B2+ blackout falls back to, so the two
+        mechanisms agree on what "no steering context" means.
+        """
+        if not self.gate_pose_tokens:
+            return int(self.num_pose_tokens), int(self.num_tokens)
+        return 0, int(self.num_tokens)
 
     def sample_context_keep_mask(
         self,

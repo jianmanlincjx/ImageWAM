@@ -138,6 +138,10 @@ class MoT(nn.Module):
         key_len = k_cat.shape[1]
         H, H_kv, D = self.num_heads, self.num_kv_heads, self.attn_head_dim
         attn_mask = self._format_attention_mask(attention_mask, batch_size, query_len, key_len, q_cat.device)
+        if attn_mask.dtype.is_floating_point and attn_mask.dtype != q_cat.dtype:
+            # SDPA wants an additive mask in the query's dtype; ours is built in
+            # float32 so the -inf entries and the gate bias stay exact.
+            attn_mask = attn_mask.to(dtype=q_cat.dtype)
 
         if return_attn_probs:
             q = q_cat.view(batch_size, query_len, H, D).transpose(1, 2)
@@ -150,7 +154,12 @@ class MoT(nn.Module):
                 k = k.repeat_interleave(repeat_factor, dim=1)
                 v = v.repeat_interleave(repeat_factor, dim=1)
             scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * (D ** -0.5)
-            scores = scores.masked_fill(~attn_mask, torch.finfo(scores.dtype).min)
+            if attn_mask.dtype.is_floating_point:
+                # Additive mask (goal-prior gate): `~mask` would be a bitwise not
+                # and throws on floats, so add it the way SDPA would.
+                scores = scores + attn_mask.to(scores.dtype)
+            else:
+                scores = scores.masked_fill(~attn_mask, torch.finfo(scores.dtype).min)
             attn_probs = torch.softmax(scores, dim=-1).to(dtype=v.dtype)
             out = torch.matmul(attn_probs, v)
             out = out.transpose(1, 2).reshape(batch_size, query_len, H * D)
@@ -711,6 +720,7 @@ class MoT(nn.Module):
         txt_len: int,
         synthetic_len: int,
         bias: torch.Tensor,
+        gated_span: tuple[int, int] | None = None,
     ) -> torch.Tensor:
         """B4. Bias the synthetic columns' attention logits.
 
@@ -719,9 +729,12 @@ class MoT(nn.Module):
         channel a genuine no-op, which is what lets Stage 2 start from the
         Stage 1 prior instead of first learning to ignore noise.
         """
+        lo, hi = (0, int(synthetic_len)) if gated_span is None else gated_span
         additive = torch.zeros(action_mask.shape, dtype=torch.float32, device=action_mask.device)
         additive = additive.masked_fill(~action_mask.to(torch.bool), float("-inf"))
-        additive[..., int(txt_len) : int(txt_len) + int(synthetic_len)] += bias.to(additive.dtype)
+        start = int(txt_len) + int(lo)
+        stop = int(txt_len) + int(hi)
+        additive[..., start:stop] += bias.to(additive.dtype)
         return additive
 
     def _flux2_update_goal_latents(
@@ -881,6 +894,7 @@ class MoT(nn.Module):
                         txt_len,
                         syn_k.shape[1],
                         aggregator.gate_bias(layer_idx, num_layers),
+                        aggregator.gated_span(),
                     )
                     if _gate_active
                     else action_mask,
@@ -960,6 +974,7 @@ class MoT(nn.Module):
                         txt_len,
                         syn_k.shape[1],
                         aggregator.gate_bias(layer_idx, num_layers),
+                        aggregator.gated_span(),
                     )
                     if _gate_active
                     else action_mask,
@@ -1196,6 +1211,7 @@ class MoT(nn.Module):
                     "syn_k": syn_k,
                     "syn_v": syn_v,
                     "gate_bias": aggregator.gate_bias(layer_idx, num_layers).detach(),
+                    "gated_span": aggregator.gated_span(),
                 }
             )
 
@@ -1234,6 +1250,7 @@ class MoT(nn.Module):
                     "syn_k": syn_k,
                     "syn_v": syn_v,
                     "gate_bias": aggregator.gate_bias(layer_idx, num_layers).detach(),
+                    "gated_span": aggregator.gated_span(),
                 }
             )
 
@@ -1266,7 +1283,11 @@ class MoT(nn.Module):
             if bias is not None and float(bias) != 0.0:
                 # txt_len is not in scope here; the cache carries it.
                 mask = self._flux2_gate_action_mask(
-                    mask, cache["txt_k"].shape[1], cache["syn_k"].shape[1], bias
+                    mask,
+                    cache["txt_k"].shape[1],
+                    cache["syn_k"].shape[1],
+                    bias,
+                    cache.get("gated_span"),
                 )
             k_cat = torch.cat(
                 [

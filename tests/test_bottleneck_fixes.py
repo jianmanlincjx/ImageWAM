@@ -74,7 +74,8 @@ def test_action_mask_unchanged_without_keep_mask():
 
 # ------------------------------------------------------------------ B4: gate
 def test_zero_init_value_and_gate_bias():
-    a = _agg(zero_init_value=True, gate_bias_init=-5.0)
+    # zero-init only makes sense when the gate also covers the pose columns
+    a = _agg(zero_init_value=True, gate_bias_init=-5.0, gate_pose_tokens=True)
     for g in a.groups:
         assert torch.count_nonzero(g.to_value.weight) == 0
         assert float(g.syn_gate_bias) == -5.0
@@ -220,3 +221,27 @@ def test_blackout_rejects_bad_prob():
 
     with pytest.raises(ValueError, match="context_blackout_prob"):
         _agg(context_blackout_prob=1.0)
+
+
+# ---------------------------------------- B4 split gate (pose columns stay on)
+def test_gated_span_excludes_pose_by_default():
+    a = _agg(num_pose_tokens=8, gate_bias_init=-5.0)
+    assert a.gated_span() == (8, 100), "pose columns must stay open"
+
+
+def test_gated_span_covers_everything_when_asked():
+    a = _agg(num_pose_tokens=8, gate_bias_init=-5.0, gate_pose_tokens=True)
+    assert a.gated_span() == (0, 100)
+
+
+def test_zero_init_with_open_pose_is_rejected():
+    """`to_value` is shared, so zero-init would silence the pose columns too."""
+    import pytest
+
+    with pytest.raises(ValueError, match="silences every synthetic column"):
+        _agg(zero_init_value=True, gate_pose_tokens=False)
+
+
+def test_split_gate_leaves_the_pose_value_path_live():
+    a = _agg(gate_bias_init=-5.0, num_pose_tokens=8)
+    assert torch.count_nonzero(a.groups[0].to_value.weight) > 0

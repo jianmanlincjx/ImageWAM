@@ -35,8 +35,17 @@ goal_prior:
   context_blackout_prob: 0.10
   # B4. Start the synthetic channel as a true no-op: zeroed values *and* a logit
   # bias, so it also takes no softmax mass. Zeroing values alone is not enough.
-  zero_init_value: true
+  # `to_value` is shared across all synthetic tokens, so zero-init would also
+  # silence the pose columns that gate_pose_tokens=false keeps open. With the
+  # split gate the cold start is carried by the logit bias alone (-5 suppresses
+  # the context columns about 150x, and it is learnable so it can open).
+  zero_init_value: false
   syn_gate_bias_init: -5.0
+  # Gate the 92 context columns only. The 8 pose columns stay open, so step 0
+  # reproduces Stage 1's [txt | pose | action] topology instead of running a
+  # pose-conditioned prior with no pose at all -- and it matches the state B2+
+  # blackout falls back to.
+  gate_pose_tokens: false
   # B1. "grid" ties context latents to a coarse spatial grid so a global
   # perturbation can no longer move every latent together. Left at "free" (the
   # evaluated behaviour) until diagnostic D2 confirms the synthetic channel
