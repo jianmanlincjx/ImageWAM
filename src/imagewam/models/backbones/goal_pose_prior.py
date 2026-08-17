@@ -28,6 +28,12 @@ GOAL_PRIOR_DROPOUT = 0.0
 # each training step. Pose tokens are never dropped. Forces the Action Expert
 # to spread its dependence instead of leaning on one aggregate.
 GOAL_PRIOR_CONTEXT_TOKEN_DROPOUT = 0.0
+# B2+: probability of masking the *entire* context block for a given sample.
+# The surviving state is [txt | pose | action] -- Stage 1's prior interface --
+# so the Action Expert is forced to keep a working policy that does not depend
+# on the context aggregate, and can fall back to it when that aggregate is
+# corrupted out of distribution.
+GOAL_PRIOR_CONTEXT_BLACKOUT_PROB = 0.0
 # B4: zero-init `to_value` so the synthetic channel starts as a no-op, and bias
 # its attention logits down so it also consumes no softmax mass at step 0.
 GOAL_PRIOR_ZERO_INIT_VALUE = False
@@ -42,7 +48,7 @@ GOAL_PRIOR_GRID_WINDOW = 1  # neighbourhood radius in coarse cells
 GOAL_PRIOR_POSE_LOSS_WEIGHT = 0.3
 GOAL_PRIOR_SYNTHETIC_TIME_VALUE = 3.0
 
-STAGE1_ONLY_CHECKPOINT_PREFIXES = ("goal_pose_encoder.",)
+STAGE1_ONLY_CHECKPOINT_PREFIXES = ("goal_pose_encoder.", "stage1_null_image_tokens")
 STAGE2_ONLY_CHECKPOINT_PREFIXES = (
     "semantic_visual_aggregator.",
     "semantic_visual_pose_norm.",
@@ -298,6 +304,7 @@ class SemanticVisualAggregator(nn.Module):
         dropout: float = GOAL_PRIOR_DROPOUT,
         num_pose_tokens: int = GOAL_PRIOR_NUM_POSE_TOKENS,
         context_token_dropout: float = GOAL_PRIOR_CONTEXT_TOKEN_DROPOUT,
+        context_blackout_prob: float = GOAL_PRIOR_CONTEXT_BLACKOUT_PROB,
         zero_init_value: bool = GOAL_PRIOR_ZERO_INIT_VALUE,
         gate_bias_init: float = GOAL_PRIOR_SYN_GATE_BIAS_INIT,
         latent_layout: str = GOAL_PRIOR_LATENT_LAYOUT,
@@ -315,6 +322,11 @@ class SemanticVisualAggregator(nn.Module):
         if not 0.0 <= self.context_token_dropout < 1.0:
             raise ValueError(
                 f"`context_token_dropout` must be in [0, 1), got {context_token_dropout}"
+            )
+        self.context_blackout_prob = float(context_blackout_prob)
+        if not 0.0 <= self.context_blackout_prob < 1.0:
+            raise ValueError(
+                f"`context_blackout_prob` must be in [0, 1), got {context_blackout_prob}"
             )
         self.latent_layout = str(latent_layout)
         if self.latent_layout not in ("free", "grid"):
@@ -377,14 +389,22 @@ class SemanticVisualAggregator(nn.Module):
         """
         if training is None:
             training = self.training
-        if not training or self.context_token_dropout <= 0.0:
+        if not training:
+            return None
+        if self.context_token_dropout <= 0.0 and self.context_blackout_prob <= 0.0:
             return None
         keep = torch.ones(int(batch_size), self.num_tokens, dtype=torch.bool, device=device)
         n_ctx = self.num_tokens - self.num_pose_tokens
         if n_ctx <= 0:
             return keep
-        drop = torch.rand(int(batch_size), n_ctx, device=device) < self.context_token_dropout
-        keep[:, self.num_pose_tokens :] = ~drop
+        if self.context_token_dropout > 0.0:
+            drop = torch.rand(int(batch_size), n_ctx, device=device) < self.context_token_dropout
+            keep[:, self.num_pose_tokens :] = ~drop
+        if self.context_blackout_prob > 0.0:
+            # Per sample, so a batch carries both the steered and the fallback
+            # regime and the Action Expert has to be competent in each.
+            blackout = torch.rand(int(batch_size), device=device) < self.context_blackout_prob
+            keep[blackout, self.num_pose_tokens :] = False
         return keep
 
     def visual_attn_mask(

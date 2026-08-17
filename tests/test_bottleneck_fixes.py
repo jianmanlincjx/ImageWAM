@@ -177,3 +177,46 @@ def test_context_dropout_follows_module_mode_by_default():
     assert a.sample_context_keep_mask(4, DEV) is not None
     a.eval()
     assert a.sample_context_keep_mask(4, DEV) is None, "must not drop at inference"
+
+
+# ------------------------------------------------------- B2+: context blackout
+def test_blackout_masks_whole_context_but_keeps_pose():
+    torch.manual_seed(0)
+    a = _agg(context_token_dropout=0.0, context_blackout_prob=0.5, num_pose_tokens=8)
+    a.train()
+    m = a.sample_context_keep_mask(512, DEV)
+    assert m[:, :8].all(), "pose tokens survive blackout"
+    ctx_alive = m[:, 8:].any(dim=1)
+    frac = 1.0 - float(ctx_alive.float().mean())
+    assert 0.4 < frac < 0.6, frac
+    # a blacked-out sample loses the entire context block, not part of it
+    for i in range(512):
+        if not bool(ctx_alive[i]):
+            assert not m[i, 8:].any()
+
+
+def test_blackout_composes_with_per_token_dropout():
+    torch.manual_seed(0)
+    a = _agg(context_token_dropout=0.2, context_blackout_prob=0.25, num_pose_tokens=8)
+    a.train()
+    m = a.sample_context_keep_mask(1024, DEV)
+    assert m[:, :8].all()
+    fully_dark = ~m[:, 8:].any(dim=1)
+    partial = m[:, 8:].any(dim=1) & ~m[:, 8:].all(dim=1)
+    assert 0.15 < float(fully_dark.float().mean()) < 0.35
+    assert float(partial.float().mean()) > 0.5, "per-token dropout still active"
+
+
+def test_blackout_alone_enables_the_mask():
+    a = _agg(context_token_dropout=0.0, context_blackout_prob=0.1)
+    a.train()
+    assert a.sample_context_keep_mask(8, DEV) is not None
+    a.eval()
+    assert a.sample_context_keep_mask(8, DEV) is None
+
+
+def test_blackout_rejects_bad_prob():
+    import pytest
+
+    with pytest.raises(ValueError, match="context_blackout_prob"):
+        _agg(context_blackout_prob=1.0)

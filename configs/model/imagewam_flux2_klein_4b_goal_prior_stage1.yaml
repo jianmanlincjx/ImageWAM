@@ -22,6 +22,9 @@ goal_prior:
   # training Stage 1 at a fixed t=0 leaves it unprepared for the range Stage 2
   # sweeps. Sampling here removes that mismatch at no cost.
   stage1_sample_video_timestep: true
+  # A2. Constant learnable stand-in for the reference image, so Stage 1's text
+  # tokens attend something rather than a zero-length stream. 0 disables.
+  stage1_null_image_tokens: 32
 
 flux2_lora_config:
   enabled: false

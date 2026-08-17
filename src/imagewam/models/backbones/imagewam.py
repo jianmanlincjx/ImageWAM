@@ -114,6 +114,7 @@ class ImageWAM(torch.nn.Module):
             GOAL_PRIOR_NUM_GOAL_TOKENS,
             GOAL_PRIOR_NUM_GROUPS,
             GOAL_PRIOR_NUM_LATENTS,
+            GOAL_PRIOR_CONTEXT_BLACKOUT_PROB,
             GOAL_PRIOR_CONTEXT_TOKEN_DROPOUT,
             GOAL_PRIOR_GRID_HW,
             GOAL_PRIOR_GRID_WINDOW,
@@ -143,6 +144,20 @@ class ImageWAM(torch.nn.Module):
         self.goal_prior_stage1_sample_video_timestep = bool(
             cfg.get("stage1_sample_video_timestep", False)
         )
+        # A2. Stage 1's image stream is zero-length, so its text tokens attend
+        # only themselves while Stage 2 gives them 784 image tokens. A constant
+        # learnable stand-in keeps the attention shape and statistics stable
+        # across the handoff. 0 disables it (the evaluated behaviour).
+        self.stage1_null_image_tokens = None
+        n_null = int(cfg.get("stage1_null_image_tokens", 0))
+        if stage == "stage1" and n_null > 0:
+            in_channels = int(getattr(self.video_expert.transformer, "in_channels", 128))
+            null = torch.empty(n_null, in_channels)
+            nn.init.trunc_normal_(null, std=0.02)
+            self.stage1_null_image_tokens = nn.Parameter(null)
+            self.stage1_null_image_tokens.data = self.stage1_null_image_tokens.data.to(
+                dtype=self.torch_dtype
+            )
         if stage is None:
             return
         if self.stack != "flux2":
@@ -180,6 +195,9 @@ class ImageWAM(torch.nn.Module):
             num_pose_tokens=num_pose_tokens,
             context_token_dropout=float(
                 cfg.get("context_token_dropout", GOAL_PRIOR_CONTEXT_TOKEN_DROPOUT)
+            ),
+            context_blackout_prob=float(
+                cfg.get("context_blackout_prob", GOAL_PRIOR_CONTEXT_BLACKOUT_PROB)
             ),
             zero_init_value=bool(cfg.get("zero_init_value", GOAL_PRIOR_ZERO_INIT_VALUE)),
             gate_bias_init=float(cfg.get("syn_gate_bias_init", GOAL_PRIOR_SYN_GATE_BIAS_INIT)),
@@ -1992,11 +2010,41 @@ class ImageWAM(torch.nn.Module):
             dim_is_pad = dim_is_pad.to(device=self.device, dtype=torch.bool, non_blocking=True)
         return goal_pose, is_pad, dim_is_pad
 
+    @staticmethod
+    def _grid_for(num_tokens: int) -> tuple[int, int]:
+        """Squarest h*w == num_tokens, so the stand-in ids look like an image."""
+        h = int(num_tokens ** 0.5)
+        while h > 1 and num_tokens % h != 0:
+            h -= 1
+        return h, num_tokens // h
+
     def _empty_flux2_image_tokens(self, batch_size: int, like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         in_channels = int(getattr(self.video_expert.transformer, "in_channels", 128))
         empty = like.new_zeros(batch_size, 0, in_channels)
         empty_ids = like.new_zeros(batch_size, 0, 4)
         return empty, empty_ids
+
+    def _stage1_null_image_stream(
+        self, batch_size: int, like: torch.Tensor
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """A2. Constant learnable stand-in for Stage 1's missing ref image."""
+        null = getattr(self, "stage1_null_image_tokens", None)
+        if null is None:
+            return None, None
+        from .flux2_video_expert import Flux2VideoExpert
+
+        tokens = null.to(device=like.device, dtype=like.dtype)
+        tokens = tokens.unsqueeze(0).expand(int(batch_size), -1, -1)
+        h, w = self._grid_for(int(null.shape[0]))
+        ids = Flux2VideoExpert.build_img_ids(
+            batch_size=int(batch_size),
+            token_height=h,
+            token_width=w,
+            time_value=10.0,  # same slot real reference images occupy
+            device=like.device,
+            dtype=like.dtype,
+        )
+        return tokens, ids
 
     def _append_goal_tokens_to_flux2_pre(self, video_pre: dict[str, Any], goal_pose: torch.Tensor) -> dict[str, Any]:
         if self.goal_pose_encoder is None:
@@ -2714,14 +2762,15 @@ class ImageWAM(torch.nn.Module):
             video_timestep = torch.zeros(
                 (batch_size,), dtype=text_hidden_states.dtype, device=self.device
             )
+        null_tokens, null_ids = self._stage1_null_image_stream(batch_size, text_hidden_states)
         video_pre = self.video_expert.pre_dit(
             x=empty_tokens,
             timestep=video_timestep,
             context=text_hidden_states,
             context_mask=text_attention_mask,
-            ref_image_hidden_states=None,
+            ref_image_hidden_states=null_tokens,
             target_img_ids=empty_ids,
-            ref_img_ids=None,
+            ref_img_ids=null_ids,
         )
         video_pre = self._append_goal_tokens_to_flux2_pre(video_pre, goal_pose)
         action_pre = self.action_expert.pre_dit(
@@ -2732,7 +2781,7 @@ class ImageWAM(torch.nn.Module):
             batch_size=batch_size,
             txt_len=int(video_pre["txt_len"]),
             target_len=0,
-            cond_len=0,
+            cond_len=int(video_pre["cond_len"]),
             action_len=int(action_pre["tokens"].shape[1]),
             device=noisy_action.device,
             text_attention_mask=video_pre["text_mask"],

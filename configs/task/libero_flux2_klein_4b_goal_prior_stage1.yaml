@@ -14,7 +14,7 @@ data:
     qwen_text_cache_format: qwen3_flux2
     pretrained_norm_stats: /data2/JM/Code/ImageWAM/runs/libero_flux2_klein_4b_base_imagewam/2026-08-13_00-24-52/dataset_stats.json
 
-batch_size: 128
+batch_size: 64
 num_workers: 8
 prefetch_factor: 2
 persistent_workers: true

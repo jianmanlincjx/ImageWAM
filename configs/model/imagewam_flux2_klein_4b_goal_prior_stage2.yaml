@@ -28,6 +28,11 @@ goal_prior:
   # cannot lean on a single aggregate. Pose tokens are never dropped.
   # Targets Language Instructions (-14.0 pp; discordant +1/-52 on libero_10).
   context_token_dropout: 0.15
+  # Mask the whole context block for 10% of samples. The fallback state is
+  # [txt | pose | action], i.e. Stage 1's prior interface. Kept low because the
+  # context block is load-bearing -- removing it outright hurt on MolmoAct2, and
+  # the Robot Initial States win (+11.6 pp) most likely runs through it.
+  context_blackout_prob: 0.10
   # B4. Start the synthetic channel as a true no-op: zeroed values *and* a logit
   # bias, so it also takes no softmax mass. Zeroing values alone is not enough.
   zero_init_value: true
