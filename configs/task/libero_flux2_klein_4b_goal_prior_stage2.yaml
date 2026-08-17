@@ -19,7 +19,7 @@ prefetch_factor: 2
 persistent_workers: true
 
 learning_rate: 1e-4
-warmup_steps: 5000
+warmup_steps: null   # 5 percent rule -> 1736, identical to the baseline run
 num_epochs: 10
 max_steps: null
 log_every: 10

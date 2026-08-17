@@ -22,6 +22,23 @@ GOAL_PRIOR_INNER_DIM = 512
 GOAL_PRIOR_FFN_RATIO = 4.0
 GOAL_PRIOR_NUM_HEADS = 8
 GOAL_PRIOR_DROPOUT = 0.0
+
+# --- bottleneck fixes; all default to the evaluated behaviour ---------------
+# B2: fraction of *context* tokens whose synthetic K/V columns are masked out
+# each training step. Pose tokens are never dropped. Forces the Action Expert
+# to spread its dependence instead of leaning on one aggregate.
+GOAL_PRIOR_CONTEXT_TOKEN_DROPOUT = 0.0
+# B4: zero-init `to_value` so the synthetic channel starts as a no-op, and bias
+# its attention logits down so it also consumes no softmax mass at step 0.
+GOAL_PRIOR_ZERO_INIT_VALUE = False
+GOAL_PRIOR_SYN_GATE_BIAS_INIT = 0.0  # set to about -5.0 to cold-start
+# B1: "free" = 100 unconstrained latents attending the whole image (evaluated
+# behaviour). "grid" ties the context latents to a coarse spatial grid and lets
+# each one attend only its own neighbourhood, so a global perturbation can no
+# longer move every latent together.
+GOAL_PRIOR_LATENT_LAYOUT = "free"
+GOAL_PRIOR_GRID_HW = (7, 7)
+GOAL_PRIOR_GRID_WINDOW = 1  # neighbourhood radius in coarse cells
 GOAL_PRIOR_POSE_LOSS_WEIGHT = 0.3
 GOAL_PRIOR_SYNTHETIC_TIME_VALUE = 3.0
 
@@ -170,6 +187,7 @@ class _SemanticVisualCrossAttentionBlock(nn.Module):
         queries: torch.Tensor,
         context: torch.Tensor,
         valid_mask: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if context.ndim != 3:
             raise ValueError(f"`context` must be [B, S, D], got {tuple(context.shape)}")
@@ -184,11 +202,19 @@ class _SemanticVisualCrossAttentionBlock(nn.Module):
             key_padding_mask = key_padding_mask.clone()
             key_padding_mask[fully_masked, 0] = False
         context_normed = self.context_norm(context)
+        if attn_mask is not None:
+            # [L, S] bool, True = blocked. Static grid geometry, so no batch dim.
+            if attn_mask.shape != (queries.shape[1], context.shape[1]):
+                raise ValueError(
+                    "`attn_mask` must be [num_queries, context_len]="
+                    f"{(queries.shape[1], context.shape[1])}, got {tuple(attn_mask.shape)}"
+                )
         update, _ = self.cross_attn(
             self.query_norm(queries),
             context_normed,
             context_normed,
             key_padding_mask=key_padding_mask,
+            attn_mask=attn_mask,
             need_weights=False,
         )
         queries = queries + self.dropout(update)
@@ -205,6 +231,8 @@ class SemanticVisualAggregatorGroup(nn.Module):
         ffn_ratio: float,
         dropout: float,
         attn_head_dim: int,
+        zero_init_value: bool = GOAL_PRIOR_ZERO_INIT_VALUE,
+        gate_bias_init: float = GOAL_PRIOR_SYN_GATE_BIAS_INIT,
     ):
         super().__init__()
         self.latent_dim = int(latent_dim)
@@ -223,6 +251,12 @@ class SemanticVisualAggregatorGroup(nn.Module):
         self.to_key = nn.Linear(latent_dim, kv_dim, bias=False)
         self.to_value = nn.Linear(latent_dim, kv_dim, bias=False)
         self.key_norm = _RMSNorm(self.attn_head_dim)
+        # B4. Zeroing `to_value` alone is not enough: the synthetic columns would
+        # still take softmax mass away from text and action. The learnable logit
+        # bias is what makes the channel a true no-op at initialisation.
+        if bool(zero_init_value):
+            nn.init.zeros_(self.to_value.weight)
+        self.syn_gate_bias = nn.Parameter(torch.tensor(float(gate_bias_init)))
 
     def forward(
         self,
@@ -232,10 +266,11 @@ class SemanticVisualAggregatorGroup(nn.Module):
         *,
         semantic_mask: torch.Tensor,
         image_mask: torch.Tensor,
+        visual_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         queries = self.self_block(queries)
         queries = self.semantic_block(queries, semantic_hidden, semantic_mask)
-        return self.visual_block(queries, visual_hidden, image_mask)
+        return self.visual_block(queries, visual_hidden, image_mask, visual_attn_mask)
 
     def project_kv(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         key = self.to_key(tokens)
@@ -261,9 +296,39 @@ class SemanticVisualAggregator(nn.Module):
         num_heads: int = GOAL_PRIOR_NUM_HEADS,
         ffn_ratio: float = GOAL_PRIOR_FFN_RATIO,
         dropout: float = GOAL_PRIOR_DROPOUT,
+        num_pose_tokens: int = GOAL_PRIOR_NUM_POSE_TOKENS,
+        context_token_dropout: float = GOAL_PRIOR_CONTEXT_TOKEN_DROPOUT,
+        zero_init_value: bool = GOAL_PRIOR_ZERO_INIT_VALUE,
+        gate_bias_init: float = GOAL_PRIOR_SYN_GATE_BIAS_INIT,
+        latent_layout: str = GOAL_PRIOR_LATENT_LAYOUT,
+        grid_hw: Sequence[int] = GOAL_PRIOR_GRID_HW,
+        grid_window: int = GOAL_PRIOR_GRID_WINDOW,
     ):
         super().__init__()
         self.num_tokens = int(num_tokens)
+        self.num_pose_tokens = int(num_pose_tokens)
+        if not 0 <= self.num_pose_tokens <= self.num_tokens:
+            raise ValueError(
+                f"`num_pose_tokens` ({num_pose_tokens}) must be in [0, num_tokens={self.num_tokens}]"
+            )
+        self.context_token_dropout = float(context_token_dropout)
+        if not 0.0 <= self.context_token_dropout < 1.0:
+            raise ValueError(
+                f"`context_token_dropout` must be in [0, 1), got {context_token_dropout}"
+            )
+        self.latent_layout = str(latent_layout)
+        if self.latent_layout not in ("free", "grid"):
+            raise ValueError(f"`latent_layout` must be 'free' or 'grid', got {latent_layout!r}")
+        self.grid_hw = (int(grid_hw[0]), int(grid_hw[1]))
+        self.grid_window = int(grid_window)
+        if self.latent_layout == "grid":
+            n_cells = self.grid_hw[0] * self.grid_hw[1]
+            if self.num_pose_tokens + n_cells > self.num_tokens:
+                raise ValueError(
+                    f"grid layout needs num_pose_tokens ({self.num_pose_tokens}) + "
+                    f"H*W ({n_cells}) <= num_tokens ({self.num_tokens})"
+                )
+        self._grid_mask_cache: dict[tuple, torch.Tensor] = {}
         self.latent_dim = int(latent_dim)
         self.context_dim = int(context_dim)
         self.kv_dim = int(kv_dim)
@@ -284,6 +349,8 @@ class SemanticVisualAggregator(nn.Module):
                     ffn_ratio=ffn_ratio,
                     dropout=dropout,
                     attn_head_dim=self.attn_head_dim,
+                    zero_init_value=zero_init_value,
+                    gate_bias_init=gate_bias_init,
                 )
                 for _ in range(self.num_layer_groups)
             ]
@@ -291,6 +358,77 @@ class SemanticVisualAggregator(nn.Module):
 
     def initial_queries(self, batch_size: int) -> torch.Tensor:
         return self.queries.unsqueeze(0).expand(int(batch_size), -1, -1).contiguous()
+
+    def gate_bias(self, layer_idx: int, num_layers: int) -> torch.Tensor:
+        """B4. Additive logit bias for this layer's synthetic columns."""
+        return self.groups[self.layer_group_index(layer_idx, num_layers)].syn_gate_bias
+
+    def sample_context_keep_mask(
+        self,
+        batch_size: int,
+        device: torch.device,
+        training: Optional[bool] = None,
+    ) -> Optional[torch.Tensor]:
+        """B2. [B, num_tokens] bool, True = keep. Pose tokens are never dropped.
+
+        Defaults to the module's own train/eval mode: defaulting to True would
+        silently apply dropout at inference for any caller that forgot the flag.
+        Returns None when the feature is off, so the caller can skip the AND.
+        """
+        if training is None:
+            training = self.training
+        if not training or self.context_token_dropout <= 0.0:
+            return None
+        keep = torch.ones(int(batch_size), self.num_tokens, dtype=torch.bool, device=device)
+        n_ctx = self.num_tokens - self.num_pose_tokens
+        if n_ctx <= 0:
+            return keep
+        drop = torch.rand(int(batch_size), n_ctx, device=device) < self.context_token_dropout
+        keep[:, self.num_pose_tokens :] = ~drop
+        return keep
+
+    def visual_attn_mask(
+        self,
+        context_len: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        """B1. [num_tokens, context_len] bool, True = blocked.
+
+        Pose tokens and any spare latents keep global access; the H*W grid
+        latents see only their own neighbourhood of image tokens. Returns None
+        under the "free" layout so nothing changes.
+        """
+        if self.latent_layout != "grid" or int(context_len) <= 0:
+            return None
+        key = (int(context_len), str(device))
+        cached = self._grid_mask_cache.get(key)
+        if cached is not None:
+            return cached
+        gh, gw = self.grid_hw
+        side = int(round(float(int(context_len)) ** 0.5))
+        if side * side != int(context_len):
+            # Non-square image token grid: fall back to global attention rather
+            # than guessing a layout that would silently mis-align the windows.
+            self._grid_mask_cache[key] = None
+            return None
+        mask = torch.ones(self.num_tokens, int(context_len), dtype=torch.bool, device=device)
+        mask[: self.num_pose_tokens] = False  # pose tokens stay global
+        rows = torch.arange(side, device=device).view(side, 1).expand(side, side).reshape(-1)
+        cols = torch.arange(side, device=device).view(1, side).expand(side, side).reshape(-1)
+        for cell in range(gh * gw):
+            tok = self.num_pose_tokens + cell
+            if tok >= self.num_tokens:
+                break
+            cy, cx = divmod(cell, gw)
+            r0 = int(cy * side / gh) - self.grid_window
+            r1 = int((cy + 1) * side / gh) + self.grid_window
+            c0 = int(cx * side / gw) - self.grid_window
+            c1 = int((cx + 1) * side / gw) + self.grid_window
+            keep = (rows >= r0) & (rows < r1) & (cols >= c0) & (cols < c1)
+            mask[tok] = ~keep
+        mask[self.num_pose_tokens + gh * gw :] = False  # spare latents stay global
+        self._grid_mask_cache[key] = mask
+        return mask
 
     def layer_group_index(self, layer_idx: int, num_layers: int) -> int:
         return layer_group_index(layer_idx, num_layers, self.num_layer_groups)
@@ -305,6 +443,7 @@ class SemanticVisualAggregator(nn.Module):
         image_mask: torch.Tensor,
         layer_idx: int,
         num_layers: int,
+        visual_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         group = self.groups[self.layer_group_index(layer_idx, num_layers)]
         return group(
@@ -313,6 +452,7 @@ class SemanticVisualAggregator(nn.Module):
             visual_hidden,
             semantic_mask=semantic_mask,
             image_mask=image_mask,
+            visual_attn_mask=visual_attn_mask,
         )
 
     def project_kv(
@@ -372,6 +512,7 @@ def build_stage2_action_attention_mask(
     action_len: int,
     device: torch.device,
     text_attention_mask: Optional[torch.Tensor] = None,
+    synthetic_keep_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Action queries attend to valid text/state, all synthetic tokens, and action self."""
     key_len = int(txt_len) + int(synthetic_len) + int(action_len)
@@ -386,6 +527,18 @@ def build_stage2_action_attention_mask(
                 f"got {tuple(text_attention_mask.shape)} for B={batch_size}, txt_len={txt_len}"
             )
         mask[:, :, :txt_len] &= text_attention_mask.to(device=device, dtype=torch.bool)[:, None, :]
+    if synthetic_keep_mask is not None:
+        if synthetic_keep_mask.ndim != 2 or tuple(synthetic_keep_mask.shape) != (
+            batch_size,
+            synthetic_len,
+        ):
+            raise ValueError(
+                "`synthetic_keep_mask` must be [B, synthetic_len], "
+                f"got {tuple(synthetic_keep_mask.shape)} for B={batch_size}, "
+                f"synthetic_len={synthetic_len}"
+            )
+        keep = synthetic_keep_mask.to(device=device, dtype=torch.bool)[:, None, :]
+        mask[:, :, txt_len : txt_len + synthetic_len] &= keep
     return mask
 
 

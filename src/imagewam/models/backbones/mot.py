@@ -100,7 +100,12 @@ class MoT(nn.Module):
         key_len: int,
         device: torch.device,
     ) -> torch.Tensor:
-        mask = attention_mask.to(device=device, dtype=torch.bool)
+        # Float masks are additive biases (used by the goal-prior gate) and must
+        # keep their dtype; everything else is a boolean keep-mask as before.
+        if attention_mask.dtype.is_floating_point:
+            mask = attention_mask.to(device=device)
+        else:
+            mask = attention_mask.to(device=device, dtype=torch.bool)
         if mask.ndim == 2:
             if tuple(mask.shape) != (query_len, key_len):
                 raise ValueError(f"2D attention mask must be {(query_len, key_len)}, got {tuple(mask.shape)}")
@@ -700,6 +705,25 @@ class MoT(nn.Module):
         syn_k = k.transpose(1, 2).reshape(batch_size, seq_len, hidden)
         return syn_k, syn_v
 
+    @staticmethod
+    def _flux2_gate_action_mask(
+        action_mask: torch.Tensor,
+        txt_len: int,
+        synthetic_len: int,
+        bias: torch.Tensor,
+    ) -> torch.Tensor:
+        """B4. Bias the synthetic columns' attention logits.
+
+        Zeroing `to_value` alone would leave the synthetic columns taking softmax
+        mass away from text and action; only an additive logit bias makes the
+        channel a genuine no-op, which is what lets Stage 2 start from the
+        Stage 1 prior instead of first learning to ignore noise.
+        """
+        additive = torch.zeros(action_mask.shape, dtype=torch.float32, device=action_mask.device)
+        additive = additive.masked_fill(~action_mask.to(torch.bool), float("-inf"))
+        additive[..., int(txt_len) : int(txt_len) + int(synthetic_len)] += bias.to(additive.dtype)
+        return additive
+
     def _flux2_update_goal_latents(
         self,
         aggregator,
@@ -716,6 +740,9 @@ class MoT(nn.Module):
         visual_mask = torch.ones(visual.shape[0], visual.shape[1], dtype=torch.bool, device=visual.device)
         if cond_len <= 0:
             visual_mask.zero_()
+        visual_attn_mask = None
+        if getattr(aggregator, "latent_layout", "free") == "grid":
+            visual_attn_mask = aggregator.visual_attn_mask(int(visual.shape[1]), visual.device)
         return aggregator.forward_layer(
             latents,
             txt,
@@ -724,6 +751,7 @@ class MoT(nn.Module):
             image_mask=visual_mask,
             layer_idx=layer_idx,
             num_layers=num_layers,
+            visual_attn_mask=visual_attn_mask,
         )
 
     def _forward_flux2_stage2(
@@ -762,6 +790,10 @@ class MoT(nn.Module):
         action_t_mod = t_mod_all["action"]
         text_mask = goal_prior["text_mask"].to(device=txt.device, dtype=torch.bool)
         action_mask = attention_mask["action"]
+        _gate_active = bool(
+            aggregator is not None
+            and any(float(g.syn_gate_bias.detach()) != 0.0 for g in aggregator.groups)
+        )
         video_mask = attention_mask["double_joint"]
         txt_len = int(txt.shape[1])
         cond_len = int(goal_prior["cond_len"])
@@ -844,7 +876,14 @@ class MoT(nn.Module):
                         [txt_v.to(action_state["v"].dtype), syn_v.to(action_state["v"].dtype), action_state["v"]],
                         dim=1,
                     ),
-                    action_mask,
+                    self._flux2_gate_action_mask(
+                        action_mask,
+                        txt_len,
+                        syn_k.shape[1],
+                        aggregator.gate_bias(layer_idx, num_layers),
+                    )
+                    if _gate_active
+                    else action_mask,
                     checkpoint=False,
                 )
                 action_tokens = a_block.apply_post(mixed, action_state)
@@ -916,7 +955,14 @@ class MoT(nn.Module):
                         [txt_v.to(action_state["v"].dtype), syn_v.to(action_state["v"].dtype), action_state["v"]],
                         dim=1,
                     ),
-                    action_mask,
+                    self._flux2_gate_action_mask(
+                        action_mask,
+                        txt_len,
+                        syn_k.shape[1],
+                        aggregator.gate_bias(layer_idx, num_layers),
+                    )
+                    if _gate_active
+                    else action_mask,
                     checkpoint=False,
                 )
                 action_tokens = a_block.apply_post(mixed, action_state)
@@ -1149,6 +1195,7 @@ class MoT(nn.Module):
                     "txt_v": video_v[:, :txt_len],
                     "syn_k": syn_k,
                     "syn_v": syn_v,
+                    "gate_bias": aggregator.gate_bias(layer_idx, num_layers).detach(),
                 }
             )
 
@@ -1186,6 +1233,7 @@ class MoT(nn.Module):
                     "txt_v": state["v"][:, :txt_len],
                     "syn_k": syn_k,
                     "syn_v": syn_v,
+                    "gate_bias": aggregator.gate_bias(layer_idx, num_layers).detach(),
                 }
             )
 
@@ -1214,6 +1262,12 @@ class MoT(nn.Module):
         action_pe = video_expert.transformer.pe_embedder(action_ids.to(device=action.device, dtype=action.dtype))
 
         def _attend(block, state, cache, mask):
+            bias = cache.get("gate_bias")
+            if bias is not None and float(bias) != 0.0:
+                # txt_len is not in scope here; the cache carries it.
+                mask = self._flux2_gate_action_mask(
+                    mask, cache["txt_k"].shape[1], cache["syn_k"].shape[1], bias
+                )
             k_cat = torch.cat(
                 [
                     cache["txt_k"].to(dtype=state["k"].dtype),

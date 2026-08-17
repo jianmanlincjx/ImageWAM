@@ -18,6 +18,10 @@ goal_prior_stage: stage1
 goal_prior:
   num_goal_tokens: 8
   inner_dim: 512
+  # A1. The FLUX text stream's adaLN is driven by the *video* timestep, so
+  # training Stage 1 at a fixed t=0 leaves it unprepared for the range Stage 2
+  # sweeps. Sampling here removes that mismatch at no cost.
+  stage1_sample_video_timestep: true
 
 flux2_lora_config:
   enabled: false

@@ -23,6 +23,23 @@ goal_prior:
   inner_dim: 512
   lambda_pose: 0.3
 
+  # --- bottleneck fixes ------------------------------------------------------
+  # B2. Drop whole context columns from the Action Expert's view each step so it
+  # cannot lean on a single aggregate. Pose tokens are never dropped.
+  # Targets Language Instructions (-14.0 pp; discordant +1/-52 on libero_10).
+  context_token_dropout: 0.15
+  # B4. Start the synthetic channel as a true no-op: zeroed values *and* a logit
+  # bias, so it also takes no softmax mass. Zeroing values alone is not enough.
+  zero_init_value: true
+  syn_gate_bias_init: -5.0
+  # B1. "grid" ties context latents to a coarse spatial grid so a global
+  # perturbation can no longer move every latent together. Left at "free" (the
+  # evaluated behaviour) until diagnostic D2 confirms the synthetic channel
+  # really is the Action Expert's dominant input.
+  latent_layout: free
+  grid_hw: [7, 7]
+  grid_window: 1
+
 flux2_lora_config:
   enabled: false
   rank: 16

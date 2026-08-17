@@ -114,8 +114,14 @@ class ImageWAM(torch.nn.Module):
             GOAL_PRIOR_NUM_GOAL_TOKENS,
             GOAL_PRIOR_NUM_GROUPS,
             GOAL_PRIOR_NUM_LATENTS,
+            GOAL_PRIOR_CONTEXT_TOKEN_DROPOUT,
+            GOAL_PRIOR_GRID_HW,
+            GOAL_PRIOR_GRID_WINDOW,
+            GOAL_PRIOR_LATENT_LAYOUT,
             GOAL_PRIOR_NUM_POSE_TOKENS,
             GOAL_PRIOR_POSE_LOSS_WEIGHT,
+            GOAL_PRIOR_SYN_GATE_BIAS_INIT,
+            GOAL_PRIOR_ZERO_INIT_VALUE,
             GoalPoseDecoder,
             GoalPoseEncoder,
             SemanticVisualAggregator,
@@ -131,6 +137,12 @@ class ImageWAM(torch.nn.Module):
         self.semantic_visual_pose_norm = None
         self.semantic_visual_pose_decoder = None
         self.goal_prior_num_pose_tokens = None
+        # A1: Stage 1 trained the FLUX text stream at a single adaLN point
+        # (video timestep 0) while Stage 2 sweeps the whole range. Sampling here
+        # removes that distribution mismatch.
+        self.goal_prior_stage1_sample_video_timestep = bool(
+            cfg.get("stage1_sample_video_timestep", False)
+        )
         if stage is None:
             return
         if self.stack != "flux2":
@@ -165,6 +177,15 @@ class ImageWAM(torch.nn.Module):
             kv_dim=kv_dim,
             attn_head_dim=attn_head_dim,
             num_layer_groups=int(cfg.get("num_layer_groups", GOAL_PRIOR_NUM_GROUPS)),
+            num_pose_tokens=num_pose_tokens,
+            context_token_dropout=float(
+                cfg.get("context_token_dropout", GOAL_PRIOR_CONTEXT_TOKEN_DROPOUT)
+            ),
+            zero_init_value=bool(cfg.get("zero_init_value", GOAL_PRIOR_ZERO_INIT_VALUE)),
+            gate_bias_init=float(cfg.get("syn_gate_bias_init", GOAL_PRIOR_SYN_GATE_BIAS_INIT)),
+            latent_layout=str(cfg.get("latent_layout", GOAL_PRIOR_LATENT_LAYOUT)),
+            grid_hw=tuple(cfg.get("grid_hw", GOAL_PRIOR_GRID_HW)),
+            grid_window=int(cfg.get("grid_window", GOAL_PRIOR_GRID_WINDOW)),
         )
         latent_dim = int(cfg.get("latent_dim", GOAL_PRIOR_LATENT_DIM))
         self.semantic_visual_pose_norm = nn.LayerNorm(latent_dim)
@@ -2680,7 +2701,19 @@ class ImageWAM(torch.nn.Module):
         target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
 
         empty_tokens, empty_ids = self._empty_flux2_image_tokens(batch_size, text_hidden_states)
-        video_timestep = torch.zeros((batch_size,), dtype=text_hidden_states.dtype, device=self.device)
+        if getattr(self, "goal_prior_stage1_sample_video_timestep", False):
+            video_timestep = self._scheduler_timestep_to_unit(
+                self.train_video_scheduler.sample_training_t(
+                    batch_size=batch_size,
+                    device=self.device,
+                    dtype=text_hidden_states.dtype,
+                ),
+                self.train_video_scheduler,
+            )
+        else:
+            video_timestep = torch.zeros(
+                (batch_size,), dtype=text_hidden_states.dtype, device=self.device
+            )
         video_pre = self.video_expert.pre_dit(
             x=empty_tokens,
             timestep=video_timestep,
@@ -2788,6 +2821,9 @@ class ImageWAM(torch.nn.Module):
             action_len=int(action_pre["tokens"].shape[1]),
             device=noisy_latent.device,
             text_attention_mask=video_pre["text_mask"],
+            synthetic_keep_mask=self.semantic_visual_aggregator.sample_context_keep_mask(
+                batch_size, noisy_latent.device, training=self.training
+            ),
         )
         tokens_out = self.mot(
             embeds_all={"video": video_pre["tokens"], "action": action_pre["tokens"]},
