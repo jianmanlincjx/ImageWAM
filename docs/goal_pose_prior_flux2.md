@@ -155,3 +155,48 @@ Smoke 通过后再开正式 Stage1 10k / Stage2 10 epoch 和 LIBERO 评测。
 - empty-image GPU 路径用 8 卡 20-step smoke 验证。
 - Stage1 显存：autograd 穿过冻结 FLUX 时必须按层 checkpoint；只 checkpoint mixed attn 不够。
 - Stage2 视频解码：启动脚本会把 venv 的 `nvidia/npp/lib` 加进 `LD_LIBRARY_PATH`，否则 dataloader worker 找不到 `libnppicc.so.11`，torchcodec 无法加载。
+
+## 评测结果
+
+两个版本都在 LIBERO 与 LIBERO-Plus 上跑过全量评测，结论相反，**不要把 `e81335b`
+当成最终版**——它的 commit message 里那句 "(evaluated version)" 指的是 v1，而 v1 低于
+baseline。进入对外表格的是 v2。
+
+| 版本 | commit | tag | LIBERO in-dist | LIBERO-Plus | vs baseline |
+|:---|:---|:---|---:|---:|---:|
+| baseline | — | — | 98.1 | 83.01 | — |
+| v1 硬防火墙 | `e81335b` | `goal-pose-prior-v1-20260825` | 97.4 | 79.73 | **−3.28** |
+| v2 门控上下文 | `e08402c` | `goal-pose-prior-v2-20260825` | 98.4 | 84.45 | **+1.44** |
+
+LIBERO-Plus 全量 10,030 个任务，baseline 与 ours 在同一批 task id 上评测，逐任务配对。
+
+### 分轴（n 加权，跨四个 suite 合并）
+
+| 轴 | n | baseline | v1 | v2 |
+|:---|---:|---:|---:|---:|
+| Camera      | 1599 | 82.93 | 68.29 (−14.63) | 83.86 (+0.94) |
+| Noise       | 1601 | 97.31 | 92.19 (−5.12)  | 95.63 (−1.69) |
+| Light       | 1142 | 98.42 | 96.06 (−2.36)  | 96.76 (−1.66) |
+| Background  | 1076 | 89.03 | 91.91 (+2.88)  | 90.24 (+1.21) |
+| Robot       | 1550 | 48.58 | 58.65 (+10.06) | **62.06 (+13.48)** |
+| Layout      | 1525 | 78.49 | 79.34 (+0.85)  | 83.48 (+4.98) |
+| Language    | 1537 | 91.74 | 79.64 (−12.10) | 83.73 (−8.00) |
+| **总计**    | 10030 | 83.01 | 79.73 (−3.28) | **84.45 (+1.44)** |
+| **w/o Language** | 8493 | 81.43 | 79.75 (−1.68) | **84.58 (+3.14)** |
+
+### 两版之间改了什么
+
+v1 把原始图像 token 对 Action Expert 完全屏蔽（硬防火墙），AE 只能通过 8 个 pose token
+看世界。结果是 Camera 掉了 14.63、Language 掉了 12.10——切断得太彻底，AE 失去了它本来
+就需要的参照信息。
+
+v2 把参考图像还给 AE，改为对 92 个无监督 context latent 做门控（8 个 pose token 全程保留，
+不参与 dropout / blackout）。Camera 从 −14.63 回到 +0.94，总体转正。
+
+轴的分配按 LIBERO-Plus 各 suite 内连续的 task-id 区间判定，不是从任务描述正则匹配——
+描述里的措辞会把 Language 改写误判进 Background。
+
+### 复现
+
+训练见 `scripts/flux2/run_train_flux2_klein_goal_prior_stage{1,2}.sh`，
+评测见 `scripts/flux2/run_eval_flux2_libero_plus.sh`。
