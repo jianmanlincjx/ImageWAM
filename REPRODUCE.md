@@ -73,7 +73,7 @@ the reported numbers use `both`.
 
 ## Checkpoints
 
-Released as `imagewam/lit_stage1` and `imagewam/lit_stage2` (Hugging Face, link in the LIT hub), each with
+Released as `imagewam/lit_stage1` and `imagewam/lit_stage2` (https://huggingface.co/linjianman/LIT), each with
 `model.pt`, `config.yaml` and `dataset_stats.json`: `CKPT_PATH=<dir>/model.pt`
 `DATASET_STATS_PATH=<dir>/dataset_stats.json`. The baseline is the released ImageWAM FLUX.2 Klein 4B checkpoint.
 
