@@ -3,7 +3,7 @@
 The **Latent Interface Training (LIT)** instantiation of *Breaking the Vision–Action Shortcut: Latent
 Interface Training for Generalizable Robot Foundation Models* on ImageWAM (FLUX.2 Klein 4B).
 Hub, project page, checkpoints: https://github.com/jianmanlincjx/LIT · https://jianmanlincjx.github.io/LIT/ ·
-https://huggingface.co/linjianman/LIT
+https://huggingface.co/linjianman/LIT (public; Stage 1 and Stage 2 for every backbone)
 
 This is a fork of [ImageWAM](https://github.com/ImageWAM/ImageWAM) (original README:
 [`README_upstream.md`](./README_upstream.md) — installation, FLUX.2 weights, data preparation).
@@ -69,6 +69,8 @@ bash scripts/flux2/run_train_flux2_klein_goal_prior_stage1.sh
 # Stage 2 — pose-supervised latent interface, initialised from Stage 1: batch 10, lr 1e-4, warmup 5%, 10 epochs
 bash scripts/flux2/run_train_flux2_klein_goal_prior_stage2.sh
 ```
+
+To skip Stage 1, use the released prior: `STAGE1_CHECKPOINT=./LIT_ckpt/imagewam/lit_stage1/model.pt`.
 
 Then evaluate `<stage2_run>/checkpoints/weights/step_034720.pt` with `<stage2_run>/dataset_stats.json`
 exactly as in §1 (the released `lit_stage2/model.pt` is that file, renamed; 34,720 steps = 10 epochs).
