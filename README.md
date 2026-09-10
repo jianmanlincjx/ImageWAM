@@ -5,7 +5,7 @@ Interface Training for Generalizable Robot Foundation Models* on ImageWAM (FLUX.
 Hub, project page, checkpoints: https://github.com/jianmanlincjx/LIT · https://jianmanlincjx.github.io/LIT/ ·
 https://huggingface.co/linjianman/LIT (public; Stage 1 and Stage 2 for every backbone)
 
-This is a fork of [ImageWAM](https://github.com/ImageWAM/ImageWAM) (original README:
+This is a fork of [ImageWAM](https://github.com/yuyangalin/ImageWAM) (original README:
 [`README_upstream.md`](./README_upstream.md) — installation, FLUX.2 weights, data preparation).
 Use branch **`feat/goal-prior-bottleneck-fix`**.
 
