@@ -1,91 +1,95 @@
 # LIT on ImageWAM
 
 The **Latent Interface Training (LIT)** instantiation of *Breaking the Vision–Action Shortcut: Latent
-Interface Training for Generalizable Robot Foundation Models* on ImageWAM.
-Cross-framework hub, project page and released checkpoints: https://github.com/jianmanlincjx/LIT ·
-https://jianmanlincjx.github.io/LIT/ · https://huggingface.co/linjianman/LIT
+Interface Training for Generalizable Robot Foundation Models* on ImageWAM (FLUX.2 Klein 4B).
+Hub, project page, checkpoints: https://github.com/jianmanlincjx/LIT · https://jianmanlincjx.github.io/LIT/ ·
+https://huggingface.co/linjianman/LIT
 
-This is a fork of [ImageWAM](https://github.com/ImageWAM/ImageWAM); the original README is kept as [`README_upstream.md`](./README_upstream.md)
-(installation of the base framework lives there). Everything below is what this fork adds.
+This is a fork of [ImageWAM](https://github.com/ImageWAM/ImageWAM) (original README:
+[`README_upstream.md`](./README_upstream.md) — installation, FLUX.2 weights, data preparation).
+Use branch **`feat/goal-prior-bottleneck-fix`**.
 
-
-This repository is the ImageWAM codebase plus a two-stage **Latent Interface Training (LIT)**
-recipe on the FLUX.2 Klein 4B backbone. This page covers only what LIT adds; for the base
-model see `README.md`.
-
-## What LIT changes
-
-The action expert is normally conditioned on backbone visual representations directly.
-LIT replaces that path:
-
-- **Stage 1** trains the action expert on language + robot state + each chunk's terminal
-  SE(3) end-effector pose, with no image observations — a spatial-goal-conditioned action
-  prior that never sees appearance.
-- **Stage 2** restores vision, but only through 100 learnable latent tokens that aggregate
-  the backbone; raw visual tokens are masked out of the action expert, and 8 of the latents
-  are supervised to reconstruct the same terminal pose (`lambda_pose = 0.3`).
-
-Stage 1's SE(3) encoder is training-time scaffolding — Stage 2 drops it and the latents
-predict the pose from vision, so no privileged input is needed at inference.
-
-## Baseline
-
-The baseline is the released ImageWAM FLUX.2 Klein 4B checkpoint, evaluated as-is; we do not
-retrain it. See `README.md` for the download.
-
-## Training LIT
-
-Configs: `configs/task/libero_flux2_klein_4b_goal_prior_stage{1,2}.yaml`, on all four LIBERO
-suites (`libero_spatial / object / goal / 10`, `no_noops`).
+**Environment and base weights** (from `README_upstream.md`; the FLUX.2 repositories on Hugging Face may
+require accepting a licence first):
 
 ```bash
-# Stage 1 — vision-free SE(3)-conditioned action prior
-#   batch 64, lr 2e-4, warmup 2000, 10000 steps
+git clone -b feat/goal-prior-bottleneck-fix https://github.com/jianmanlincjx/ImageWAM.git && cd ImageWAM
+uv sync --python 3.11 --extra shared && source .venv/bin/activate
+cp .env.example .env.local           # the scripts read paths from here
+
+git clone https://github.com/black-forest-labs/flux2 third_party/flux2          # FLUX.2 source (pinned commit in README_upstream)
+hf download black-forest-labs/FLUX.2-klein-base-4B --local-dir checkpoints/flux2/FLUX.2-klein-base-4B
+hf download black-forest-labs/FLUX.2-dev ae.safetensors --local-dir checkpoints/flux2/FLUX.2-dev   # gated
+# in .env.local
+FLUX2_SRC=$PWD/third_party/flux2
+FLUX2_MODEL_PATH=$PWD/checkpoints/flux2/FLUX.2-klein-base-4B/flux-2-klein-base-4b.safetensors
+FLUX2_AE_MODEL_PATH=$PWD/checkpoints/flux2/FLUX.2-dev/ae.safetensors
+FLUX2_QWEN3_MODEL_SPEC=Qwen/Qwen3-4B
+```
+
+Every LIBERO-Plus number was produced with **`LIBERO_PLUS_FIX_LANG=1`**; Overall is the mean over the seven
+perturbation axes. ImageWAM evaluates in three conditioning modes (`both` / `ref_only` / `syn_only`); the
+reported numbers use `both`.
+
+---
+
+## 1. Evaluate the released checkpoint
+
+```bash
+hf download linjianman/LIT --include "imagewam/*" --local-dir ./LIT_ckpt
+export CKPT_PATH=./LIT_ckpt/imagewam/lit_stage2/model.pt
+export DATASET_STATS_PATH=./LIT_ckpt/imagewam/lit_stage2/dataset_stats.json
+```
+
+```bash
+# LIBERO (in-distribution)
+NUM_GPUS=8 FLUX2_VARIANT=4b bash scripts/flux2/run_eval_flux2_libero.sh
+
+# LIBERO-Plus (out of distribution): 10,030 tasks, one episode each
+LIBERO_PLUS_FIX_LANG=1 NUM_GPUS=8 FLUX2_VARIANT=4b bash scripts/flux2/run_eval_flux2_libero_plus.sh
+```
+
+Both launchers run the manager in `experiments/libero/`; results are written per task as
+`gpu*_task*_results.json` with `summary.json` and `task_success_rates.csv` alongside. Aggregate the
+LIBERO-Plus run per axis with `scripts/aggregate.py` in the LIT hub.
+
+---
+
+## 2. Train, then evaluate
+
+The **baseline** is the released ImageWAM FLUX.2 Klein 4B LIBERO checkpoint evaluated as-is
+(see the Hugging Face collection linked from `README_upstream.md`); we do not retrain it. Data: LIBERO, all
+four suites, `no_noops`, prepared as in `README_upstream.md` (`scripts/data/`). **LIT** is two runs on
+`configs/task/libero_flux2_klein_4b_goal_prior_stage{1,2}.yaml`:
+
+```bash
+# Stage 1 — vision-free SE(3)-conditioned action prior: batch 64, lr 2e-4, warmup 2000, 10K steps
 bash scripts/flux2/run_train_flux2_klein_goal_prior_stage1.sh
 
-# Stage 2 — pose-supervised latent interface, initialised from Stage 1
-#   batch 10, lr 1e-4, warmup = 5% of the schedule, 10 epochs
+# Stage 2 — pose-supervised latent interface, initialised from Stage 1: batch 10, lr 1e-4, warmup 5%, 10 epochs
 bash scripts/flux2/run_train_flux2_klein_goal_prior_stage2.sh
 ```
 
-Interface settings are identical to the other three backbones and were not tuned per model:
-`num_latents=100`, `num_pose_tokens=8`, `latent_dim=768`, `inner_dim=512`, `lambda_pose=0.3`.
+Then evaluate `<stage2_run>/checkpoints/weights/step_034720.pt` with `<stage2_run>/dataset_stats.json`
+exactly as in §1 (the released `lit_stage2/model.pt` is that file, renamed; 34,720 steps = 10 epochs).
+`scripts/audit_goal_prior_v2.py` checks a Stage-2 run's latent usage before you trust it.
 
-## Evaluation
+---
 
-### LIBERO (in-distribution)
+## 3. How LIT is integrated in ImageWAM
 
-```bash
-export CKPT_PATH=<stage2_run>/checkpoints/weights/step_034720.pt
-export DATASET_STATS_PATH=<stage2_run>/dataset_stats.json
-NUM_GPUS=8 FLUX2_VARIANT=4b bash scripts/flux2/run_eval_flux2_libero.sh
-```
+ImageWAM is a world–action model built on an image-editing foundation model: the FLUX.2 Klein DiT edits
+the current observation towards the future, and an action head generates the chunk from the DiT's
+per-block features (`src/imagewam/`). LIT touches only the path from those features to the action head:
 
-### LIBERO-Plus (out of distribution)
+| Piece | Where | What it does |
+| --- | --- | --- |
+| Latent interface | `src/imagewam/models/backbones/goal_pose_prior.py`, wired in `backbones/imagewam.py` / `mot.py` | 100 learnable latents cross-attend to the FLUX.2 block features and the Qwen3 text tokens and become the action head's only visual input |
+| Firewall | `backbones/imagewam.py`, switched by `goal_prior_stage: stage2` in `configs/model/imagewam_flux2_klein_4b_goal_prior_stage2.yaml` | the direct feature path from the DiT into the action head is closed |
+| Spatial supervision | `GoalPoseDecoder` in `goal_pose_prior.py`, `goal_prior.lambda_pose: 0.3` | 8 latents decode to the chunk-end SE(3) target; MSE added to the action objective |
+| Stage-1 conditioning | `GoalPoseEncoder` in `goal_pose_prior.py`, `goal_prior_stage: stage1` | terminal pose encoded into the action head's conditioning while the image backbone is off |
+| Launchers | `scripts/flux2/run_train_flux2_klein_goal_prior_stage{1,2}.sh` | Stage 2 reads the Stage-1 weights |
 
-[LIBERO-Plus](https://github.com/sylvestf/LIBERO-plus) is 10,030 perturbed tasks over seven
-axes, one episode each.
-
-```bash
-export CKPT_PATH=<stage2_run>/checkpoints/weights/step_034720.pt
-export DATASET_STATS_PATH=<stage2_run>/dataset_stats.json
-LIBERO_PLUS_FIX_LANG=1 NUM_GPUS=8 FLUX2_VARIANT=4b \
-  bash scripts/flux2/run_eval_flux2_libero_plus.sh
-```
-
-**`LIBERO_PLUS_FIX_LANG=1` is required.** Upstream LIBERO-Plus derives the instruction from
-the perturbed file name, so on every non-language axis the policy is otherwise fed strings
-like `... view 0 0 100 2 352 initstate 0`. Numbers produced without it are not comparable.
-
-ImageWAM supports three conditioning modes at evaluation (`both` / `ref_only` / `syn_only`);
-the reported numbers use `both`.
-
-## Checkpoints
-
-Released as `imagewam/lit_stage1` and `imagewam/lit_stage2` (https://huggingface.co/linjianman/LIT), each with
-`model.pt`, `config.yaml` and `dataset_stats.json`: `CKPT_PATH=<dir>/model.pt`
-`DATASET_STATS_PATH=<dir>/dataset_stats.json`. The baseline is the released ImageWAM FLUX.2 Klein 4B checkpoint.
-
-## The same method on other backbones
-
-π0.5 `jianmanlincjx/pi05` · MolmoAct2 `jianmanlincjx/Molmoact2` · FAST-WAM `jianmanlincjx/fastwam`
+Interface settings match the other three backbones and were not tuned per model: `num_latents=100`,
+`num_pose_tokens=8`, `latent_dim=768`, `inner_dim=512`, `lambda_pose=0.3`. Action representation, horizon
+(16) and replanning (12) are the upstream ImageWAM defaults.
