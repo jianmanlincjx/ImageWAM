@@ -1,3 +1,11 @@
+> **Latent Interface Training (LIT) — this fork.**
+> This repository is the ImageWAM instantiation of *Breaking the Vision–Action Shortcut: Latent
+> Interface Training for Generalizable Robot Foundation Models*. The upstream README follows
+> below unchanged. For the paper's training recipe, evaluation protocols and checkpoint map,
+> read [`REPRODUCE.md`](./REPRODUCE.md); the cross-framework hub, project page and released
+> checkpoints are at [jianmanlincjx/LIT](https://github.com/jianmanlincjx/LIT).
+> Use branch `feat/goal-prior-bottleneck-fix`.
+
 <div align="center">
   <h1>ImageWAM</h1>
   <h3>Do World Action Models Really Need Video Generation,<br>or Just Image Editing?</h3>
