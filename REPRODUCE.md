@@ -73,8 +73,9 @@ the reported numbers use `both`.
 
 ## Checkpoints
 
-`paper_ckpt/imagewam/lit_stage1/step_010000.pt` and `lit_stage2/step_034720.pt`, each with the
-`config.yaml` and `dataset_stats.json` of its run.
+Released as `imagewam/lit_stage1` and `imagewam/lit_stage2` (Hugging Face, link in the LIT hub), each with
+`model.pt`, `config.yaml` and `dataset_stats.json`: `CKPT_PATH=<dir>/model.pt`
+`DATASET_STATS_PATH=<dir>/dataset_stats.json`. The baseline is the released ImageWAM FLUX.2 Klein 4B checkpoint.
 
 ## The same method on other backbones
 
